@@ -1545,23 +1545,26 @@ function WhitelistSettingsCard({
 
 // ─── EmailConfigCard ─────────────────────────────────────────────────────────
 
-type EmailProvider = 'google' | 'outlook' | 'custom'
+type EmailProvider = 'google' | 'gmail' | 'outlook' | 'custom'
 
 interface EmailConnection {
   id: string
   provider: EmailProvider
+  connection_type: 'direct' | 'forwarder'
   email: string
   imapHost?: string
-  imapPort?: number
+  imapPort?: number | string
   smtpHost?: string
-  smtpPort?: number
+  smtpPort?: number | string
   connected_at?: string
 }
 
 function EmailConfigCard({ userEmail }: { userEmail: string }) {
   const [connections, setConnections] = useState<EmailConnection[]>([])
   const [isAddOpen, setIsAddOpen] = useState(false)
-  const [provider, setProvider] = useState<EmailProvider>('outlook')
+  const [provider, setProvider] = useState<EmailProvider>('gmail')
+  const [connectionType, setConnectionType] = useState<'direct' | 'forwarder'>('direct')
+  const [showForwarderSmtp, setShowForwarderSmtp] = useState(false)
   const [configEmail, setConfigEmail] = useState('')
   const [configPassword, setConfigPassword] = useState('')
   const [imapHost, setImapHost] = useState('')
@@ -1597,10 +1600,15 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
     setProvider(p)
     setError('')
     setSuccess('')
-    if (p === 'outlook') {
-      setImapHost('imap-mail.outlook.com')
+    if (p === 'gmail' || p === 'google') {
+      setImapHost('imap.gmail.com')
       setImapPort('993')
-      setSmtpHost('smtp-mail.outlook.com')
+      setSmtpHost('smtp.gmail.com')
+      setSmtpPort('465')
+    } else if (p === 'outlook') {
+      setImapHost('outlook.office365.com')
+      setImapPort('993')
+      setSmtpHost('smtp.office365.com')
       setSmtpPort('587')
     } else if (p === 'custom') {
       setImapHost('')
@@ -1618,15 +1626,23 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
     try {
       const payload: Record<string, any> = {
         provider,
-        email: provider === 'google' ? userEmail : configEmail.trim(),
+        connection_type: connectionType,
+        email: configEmail.trim(),
         connected_at: new Date().toISOString(),
       }
-      if (provider !== 'google') {
+      if (connectionType === 'direct') {
         payload.password = configPassword
         payload.imapHost = imapHost.trim()
         payload.imapPort = parseInt(imapPort) || 993
         payload.smtpHost = smtpHost.trim()
         payload.smtpPort = parseInt(smtpPort) || 587
+      } else {
+        // Forwarder mode: SMTP is optional
+        if (configPassword.trim() && smtpHost.trim()) {
+          payload.password = configPassword.trim()
+          payload.smtpHost = smtpHost.trim()
+          payload.smtpPort = parseInt(smtpPort) || 587
+        }
       }
 
       const colRef = collection(db, `users/${userEmail}/email_connections`)
@@ -1695,9 +1711,9 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
   }
 
   const PROVIDERS: { key: EmailProvider; label: string; desc: string }[] = [
-    { key: 'google', label: 'Google', desc: 'Gmail webhook' },
-    { key: 'outlook', label: 'Outlook', desc: 'Office 365 IMAP' },
-    { key: 'custom', label: 'Egyéni IMAP', desc: 'Saját levelező' },
+    { key: 'gmail', label: 'Google Mail', desc: 'Gmail fiókok' },
+    { key: 'outlook', label: 'Outlook', desc: 'Office 365' },
+    { key: 'custom', label: 'Egyéni szerver', desc: 'IMAP / SMTP' },
   ]
 
   return (
@@ -1830,37 +1846,61 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
 
               {/* Form */}
               <form onSubmit={handleAddConnection} className="space-y-4">
-                {provider === 'google' ? (
-                  <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-4">
-                    <p className="text-xs text-slate-400">
-                      A Google integráció a meglévő webhook pipeline-on keresztül automatikusan működik. Mentés után a rendszer fogadja a továbbított e-maileket.
-                    </p>
+                {/* Connection Mode Toggle */}
+                <div className="space-y-2">
+                  <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Kapcsolódási Mód</label>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setConnectionType('direct')}
+                      className={`flex-1 rounded-xl border p-2.5 text-center text-xs font-semibold transition-all ${
+                        connectionType === 'direct'
+                          ? 'border-violet-500/50 bg-violet-500/10 text-white'
+                          : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      Direkt szinkronizáció (Kétirányú IMAP/SMTP)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConnectionType('forwarder')}
+                      className={`flex-1 rounded-xl border p-2.5 text-center text-xs font-semibold transition-all ${
+                        connectionType === 'forwarder'
+                          ? 'border-violet-500/50 bg-violet-500/10 text-white'
+                          : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      Automatikus továbbítás (Forwarder webhook)
+                    </button>
                   </div>
-                ) : (
+                </div>
+
+                <div>
+                  <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">E-mail cím</label>
+                  <input
+                    type="email"
+                    required
+                    value={configEmail}
+                    onChange={(e) => setConfigEmail(e.target.value)}
+                    placeholder={provider === 'gmail' || provider === 'google' ? 'user@gmail.com' : 'user@outlook.com'}
+                    className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                  />
+                </div>
+
+                {connectionType === 'direct' ? (
                   <>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">E-mail cím</label>
-                        <input
-                          type="email"
-                          required
-                          value={configEmail}
-                          onChange={(e) => setConfigEmail(e.target.value)}
-                          placeholder="user@outlook.com"
-                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Alkalmazás jelszó</label>
-                        <input
-                          type="password"
-                          required
-                          value={configPassword}
-                          onChange={(e) => setConfigPassword(e.target.value)}
-                          placeholder="••••••••"
-                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                        />
-                      </div>
+                    <div>
+                      <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
+                        {provider === 'gmail' || provider === 'google' || provider === 'outlook' ? 'Alkalmazásjelszó' : 'Jelszó'}
+                      </label>
+                      <input
+                        type="password"
+                        required
+                        value={configPassword}
+                        onChange={(e) => setConfigPassword(e.target.value)}
+                        placeholder="••••••••"
+                        className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                      />
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1871,7 +1911,7 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
                           required
                           value={imapHost}
                           onChange={(e) => setImapHost(e.target.value)}
-                          placeholder="imap-mail.outlook.com"
+                          placeholder="imap.gmail.com"
                           className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
                         />
                       </div>
@@ -1895,7 +1935,7 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
                           required
                           value={smtpHost}
                           onChange={(e) => setSmtpHost(e.target.value)}
-                          placeholder="smtp-mail.outlook.com"
+                          placeholder="smtp.gmail.com"
                           className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
                         />
                       </div>
@@ -1911,6 +1951,81 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
                       </div>
                     </div>
                   </>
+                ) : (
+                  <div className="space-y-4">
+                    <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-4 space-y-2">
+                      <div className="flex justify-between items-center">
+                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Webhook gyűjtőcím</label>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const addr = `${configEmail.trim().replace('@', '-')}-inbound@task.normaflow.hu`
+                            navigator.clipboard.writeText(addr)
+                            alert('Másolva: ' + addr)
+                          }}
+                          className="text-[10px] font-bold text-violet-400 hover:text-violet-300 underline"
+                        >
+                          Másolás
+                        </button>
+                      </div>
+                      <input
+                        type="text"
+                        readOnly
+                        value={configEmail.trim() ? `${configEmail.trim().replace('@', '-')}-inbound@task.normaflow.hu` : 'Adja meg a fenti e-mail címet...'}
+                        className="w-full rounded-xl border border-slate-700/50 bg-slate-950/40 p-2.5 text-xs text-slate-400 font-mono focus:outline-none"
+                      />
+                      <p className="text-[10px] text-slate-500">
+                        Irányítsa át az e-maileket erre a címre a Gmail vagy Outlook beállításainál.
+                      </p>
+                    </div>
+
+                    {/* Expandable sub-form for optional SMTP */}
+                    <div className="border border-slate-800 rounded-xl bg-slate-900/20 overflow-hidden">
+                      <button
+                        type="button"
+                        onClick={() => setShowForwarderSmtp(!showForwarderSmtp)}
+                        className="w-full flex items-center justify-between p-3.5 text-xs font-semibold text-slate-300 hover:bg-slate-800/40 transition-colors"
+                      >
+                        <span>Kimenő levelek küldése erről a címről (Opcionális SMTP beállítások)</span>
+                        <span className="text-slate-500">{showForwarderSmtp ? '▲' : '▼'}</span>
+                      </button>
+                      {showForwarderSmtp && (
+                        <div className="p-4 border-t border-slate-800 space-y-4">
+                          <div>
+                            <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP Alkalmazásjelszó</label>
+                            <input
+                              type="password"
+                              value={configPassword}
+                              onChange={(e) => setConfigPassword(e.target.value)}
+                              placeholder="••••••••"
+                              className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                            />
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                              <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP szerver</label>
+                              <input
+                                type="text"
+                                value={smtpHost}
+                                onChange={(e) => setSmtpHost(e.target.value)}
+                                placeholder="smtp.gmail.com"
+                                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP port</label>
+                              <input
+                                type="number"
+                                value={smtpPort}
+                                onChange={(e) => setSmtpPort(e.target.value)}
+                                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 )}
 
                 <button
@@ -1946,15 +2061,24 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
                   connections.map((conn) => (
                     <tr key={conn.id} className="hover:bg-slate-900/30 transition-colors">
                       <td className="p-4">
-                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold capitalize border ${
-                          conn.provider === 'google'
-                            ? 'bg-red-500/10 text-red-400 border-red-500/20'
-                            : conn.provider === 'outlook'
-                            ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
-                            : 'bg-violet-500/10 text-violet-400 border-violet-500/20'
-                        }`}>
-                          {conn.provider}
-                        </span>
+                        <div className="flex flex-wrap gap-1.5 items-center">
+                          <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold capitalize border ${
+                            conn.provider === 'google' || conn.provider === 'gmail'
+                              ? 'bg-red-500/10 text-red-400 border-red-500/20'
+                              : conn.provider === 'outlook'
+                              ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                              : 'bg-violet-500/10 text-violet-400 border-violet-500/20'
+                          }`}>
+                            {conn.provider === 'google' ? 'Gmail' : conn.provider}
+                          </span>
+                          <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold border ${
+                            conn.connection_type === 'direct'
+                              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                              : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                          }`}>
+                            {conn.connection_type === 'direct' ? 'Direkt' : 'Továbbítás'}
+                          </span>
+                        </div>
                       </td>
                       <td className="p-4 font-medium text-slate-200">{conn.email}</td>
                       <td className="p-4 text-xs text-slate-500 font-mono">
@@ -1978,7 +2102,7 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
           </div>
 
           {/* Manual sync and details */}
-          {connections.some(c => c.provider !== 'google') && (
+          {connections.some(c => c.connection_type === 'direct') && (
             <div className="border-t border-slate-800/80 pt-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
               <button
                 type="button"
