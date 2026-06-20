@@ -204,7 +204,10 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
           const verifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
             size: 'invisible'
           })
-          const phoneInfoOptions = mfaResolver.hints[0]
+          const phoneInfoOptions = {
+            multiFactorHint: mfaResolver.hints[0],
+            session: mfaResolver.session
+          }
           const phoneAuthProvider = new PhoneAuthProvider(auth)
           const vId = await phoneAuthProvider.verifyPhoneNumber(phoneInfoOptions, verifier)
           setMfaVerificationId(vId)
@@ -505,12 +508,10 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
 function PaywallView({
   userEmail,
   onSubscribe,
-  onDevBypass,
   onLogout,
 }: {
   userEmail: string
   onSubscribe: () => void
-  onDevBypass: () => void
   onLogout: () => void
 }) {
   const [isCheckingOut, setIsCheckingOut] = useState(false)
@@ -607,19 +608,6 @@ function PaywallView({
             )}
           </button>
 
-          <div className="mt-6 border-t border-slate-800 pt-6">
-            <button
-              type="button"
-              onClick={onDevBypass}
-              className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-amber-500/40 bg-amber-500/5 px-4 py-2.5 text-xs font-medium text-amber-400 transition-all hover:border-amber-500/60 hover:bg-amber-500/10"
-            >
-              <AlertTriangle className="h-3.5 w-3.5" />
-              Fejlesztői Bypass / Tesztelés
-            </button>
-            <p className="mt-2 text-center text-[10px] text-slate-600">
-              Csak fejlesztői környezetben — kihagyja az előfizetési ellenőrzést
-            </p>
-          </div>
         </div>
       </div>
     </div>
@@ -746,6 +734,8 @@ function MainDashboard({
   promptRules,
   onSaveAutomation,
   onOpenFeedback,
+  processedEmailsThisMonth,
+  tier,
 }: {
   userEmail: string
   tasks: Task[]
@@ -760,7 +750,11 @@ function MainDashboard({
   promptRules: string
   onSaveAutomation: (rules: string, enabled: boolean) => Promise<void> | void
   onOpenFeedback: () => void
+  processedEmailsThisMonth: number
+  tier: string
 }) {
+  const limit = tier === 'pro' ? 1500 : tier === 'ultra' ? 5000 : 500
+
   const pendingForUser = useMemo(
     () =>
       tasks.filter(
@@ -846,6 +840,27 @@ function MainDashboard({
             </button>
           </nav>
         </div>
+
+        {/* Utilization Bar */}
+        <div className="px-4 py-4 border-b border-slate-800/60">
+          <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-slate-500 mb-1.5">
+            <span>Havi keret</span>
+            <span className="text-slate-400 font-bold capitalize">{tier}</span>
+          </div>
+          <div className="flex items-baseline justify-between text-xs text-slate-300 font-medium mb-1">
+            <span>{processedEmailsThisMonth} / {limit} db</span>
+            <span>{Math.min(100, Math.round((processedEmailsThisMonth / limit) * 100))}%</span>
+          </div>
+          <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${
+                processedEmailsThisMonth >= limit ? 'bg-rose-500 shadow-lg shadow-rose-500/20' : 'bg-indigo-500 shadow-lg shadow-indigo-500/20'
+              }`}
+              style={{ width: `${Math.min(100, (processedEmailsThisMonth / limit) * 100)}%` }}
+            />
+          </div>
+        </div>
+
 
         {/* Category Filters (Visible only for tasks tab) */}
         {activeTab === 'tasks' ? (
@@ -1004,6 +1019,20 @@ function MainDashboard({
 
             {/* Task List */}
             <main className="flex-1 overflow-y-auto p-4 sm:p-6">
+              {processedEmailsThisMonth >= limit && (
+                <div className="mx-auto max-w-3xl mb-6 rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 flex gap-3 shadow-lg shadow-rose-950/20">
+                  <AlertTriangle className="h-5 w-5 shrink-0 text-rose-400 mt-0.5" />
+                  <div className="text-sm text-slate-300">
+                    <span className="font-bold text-rose-300 block mb-1">
+                      Elérte a havi limitet
+                    </span>
+                    <p className="leading-relaxed text-xs">
+                      Elérte a csomagjában foglalt havi e-mail limitet. Az automatizáció szünetel. Váltson Pro vagy Ultra csomagra.
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {filteredTasks.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-24 text-center">
                   <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl bg-slate-800">
@@ -1066,11 +1095,13 @@ function MainDashboard({
 
             <main className="flex-1 overflow-y-auto p-4 sm:p-6 bg-slate-950">
               <AutoResponder
-                initialEnabled={automationEnabled}
+                initialEnabled={automationEnabled && processedEmailsThisMonth < limit}
                 initialRules={promptRules}
                 onSave={onSaveAutomation}
+                limitExceeded={processedEmailsThisMonth >= limit}
               />
               <div className="mx-auto max-w-3xl px-4 pb-12 sm:px-6">
+                <EmailConfigCard userEmail={userEmail} />
                 <MfaSettingsCard />
               </div>
             </main>
@@ -1081,7 +1112,320 @@ function MainDashboard({
   )
 }
 
+// ─── EmailConfigCard ─────────────────────────────────────────────────────────
+
+type EmailProvider = 'google' | 'outlook' | 'custom'
+
+function EmailConfigCard({ userEmail }: { userEmail: string }) {
+  const [provider, setProvider] = useState<EmailProvider>('google')
+  const [configEmail, setConfigEmail] = useState('')
+  const [configPassword, setConfigPassword] = useState('')
+  const [imapHost, setImapHost] = useState('')
+  const [imapPort, setImapPort] = useState('993')
+  const [smtpHost, setSmtpHost] = useState('')
+  const [smtpPort, setSmtpPort] = useState('587')
+  const [isLoading, setIsLoading] = useState(false)
+  const [isSyncing, setIsSyncing] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
+  const [isConnected, setIsConnected] = useState(false)
+  const [connectedProvider, setConnectedProvider] = useState<EmailProvider | null>(null)
+
+  // Load existing config on mount
+  useEffect(() => {
+    const loadConfig = async () => {
+      try {
+        const configRef = doc(db, `users/${userEmail}/tokens/email_config`)
+        const snap = await getDoc(configRef)
+        if (snap.exists()) {
+          const data = snap.data()
+          setProvider(data.provider || 'google')
+          setConfigEmail(data.email || '')
+          setImapHost(data.imapHost || '')
+          setImapPort(String(data.imapPort || 993))
+          setSmtpHost(data.smtpHost || '')
+          setSmtpPort(String(data.smtpPort || 587))
+          setIsConnected(true)
+          setConnectedProvider(data.provider || 'google')
+        }
+      } catch (err) {
+        console.error('Error loading email config:', err)
+      }
+    }
+    loadConfig()
+  }, [userEmail])
+
+  // Pre-fill servers when provider changes
+  const handleProviderChange = (p: EmailProvider) => {
+    setProvider(p)
+    setError('')
+    setSuccess('')
+    if (p === 'outlook') {
+      setImapHost('imap-mail.outlook.com')
+      setImapPort('993')
+      setSmtpHost('smtp-mail.outlook.com')
+      setSmtpPort('587')
+    } else if (p === 'custom') {
+      setImapHost('')
+      setImapPort('993')
+      setSmtpHost('')
+      setSmtpPort('587')
+    }
+  }
+
+  const handleSaveConfig = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setIsLoading(true)
+    setError('')
+    setSuccess('')
+    try {
+      const payload: Record<string, any> = {
+        provider,
+        email: provider === 'google' ? userEmail : configEmail.trim(),
+        connected_at: new Date().toISOString(),
+      }
+      if (provider !== 'google') {
+        payload.password = configPassword
+        payload.imapHost = imapHost.trim()
+        payload.imapPort = parseInt(imapPort) || 993
+        payload.smtpHost = smtpHost.trim()
+        payload.smtpPort = parseInt(smtpPort) || 587
+      }
+      const configRef = doc(db, `users/${userEmail}/tokens/email_config`)
+      await setDoc(configRef, payload, { merge: true })
+      setIsConnected(true)
+      setConnectedProvider(provider)
+      setSuccess('E-mail fiók sikeresen összekapcsolva!')
+    } catch (err: any) {
+      setError(err.message || 'Hiba történt a konfiguráció mentése során.')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleManualSync = async () => {
+    setIsSyncing(true)
+    setError('')
+    setSuccess('')
+    try {
+      const token = await auth.currentUser?.getIdToken(true)
+      const res = await fetch('https://syncemailsnow-cdaanjspxq-uc.a.run.app', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token || ''}`,
+        },
+        body: JSON.stringify({}),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Szinkronizálási hiba.')
+      setSuccess(data.message || 'Szinkronizálás kész.')
+    } catch (err: any) {
+      setError(err.message || 'Hiba a levelek szinkronizálásakor.')
+    } finally {
+      setIsSyncing(false)
+    }
+  }
+
+  const PROVIDERS: { key: EmailProvider; label: string; desc: string }[] = [
+    { key: 'google', label: 'Google', desc: 'Gmail webhook' },
+    { key: 'outlook', label: 'Outlook', desc: 'Office 365 IMAP' },
+    { key: 'custom', label: 'Egyéni', desc: 'IMAP / SMTP' },
+  ]
+
+  return (
+    <div className="relative mt-8 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md animate-fade-in text-slate-100">
+      <div className="absolute -left-24 -top-24 h-48 w-48 rounded-full bg-violet-600/5 blur-3xl" />
+
+      {/* Header */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/80 pb-6">
+        <div>
+          <div className="flex items-center gap-2">
+            <Mail className="h-5 w-5 text-indigo-400" />
+            <h3 className="text-lg font-bold tracking-tight text-white">Email Fiók Összekötése</h3>
+          </div>
+          <p className="mt-1 text-sm text-slate-400">
+            Válasszon szolgáltatót a beérkező levelek automatikus feldolgozásához.
+          </p>
+        </div>
+
+        {isConnected && connectedProvider && (
+          <span className="text-xs font-bold uppercase rounded-full px-2.5 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            {connectedProvider === 'google' ? 'Google' : connectedProvider === 'outlook' ? 'Outlook' : 'Egyéni'} aktív
+          </span>
+        )}
+      </div>
+
+      <div className="mt-6 space-y-5">
+        {error && (
+          <div className="rounded-lg bg-red-500/15 border border-red-500/20 p-3 text-xs font-medium text-red-400">{error}</div>
+        )}
+        {success && (
+          <div className="rounded-lg bg-emerald-500/15 border border-emerald-500/20 p-3 text-xs font-medium text-emerald-400">{success}</div>
+        )}
+
+        {/* Provider Selector */}
+        <div className="flex gap-2">
+          {PROVIDERS.map((p) => (
+            <button
+              key={p.key}
+              type="button"
+              onClick={() => handleProviderChange(p.key)}
+              className={`flex-1 rounded-xl border p-3 text-center transition-all ${
+                provider === p.key
+                  ? 'border-indigo-500/50 bg-indigo-500/10 text-white'
+                  : 'border-slate-800 bg-slate-950/40 text-slate-400 hover:border-slate-700 hover:text-slate-300'
+              }`}
+            >
+              <div className="text-sm font-semibold">{p.label}</div>
+              <div className="text-[10px] mt-0.5 opacity-70">{p.desc}</div>
+            </button>
+          ))}
+        </div>
+
+        {/* Google Info */}
+        {provider === 'google' && (
+          <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+            <p className="text-sm text-slate-300">
+              A Google integráció a meglévő webhook pipeline-on keresztül működik.
+              Konfigurálás nem szükséges — a rendszer automatikusan fogadja a továbbított e-maileket.
+            </p>
+            <button
+              type="button"
+              onClick={handleSaveConfig}
+              disabled={isLoading}
+              className="mt-4 flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 disabled:opacity-55"
+            >
+              {isLoading ? 'Mentés…' : 'Google konfiguráció mentése'}
+            </button>
+          </div>
+        )}
+
+        {/* Outlook / Custom Form */}
+        {provider !== 'google' && (
+          <form onSubmit={handleSaveConfig} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="cfg-email" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">E-mail cím</label>
+                <input
+                  id="cfg-email"
+                  type="email"
+                  required
+                  value={configEmail}
+                  onChange={(e) => setConfigEmail(e.target.value)}
+                  placeholder="user@company.hu"
+                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-pass" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">Alkalmazás jelszó</label>
+                <input
+                  id="cfg-pass"
+                  type="password"
+                  required
+                  value={configPassword}
+                  onChange={(e) => setConfigPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="cfg-imap-host" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">IMAP szerver</label>
+                <input
+                  id="cfg-imap-host"
+                  type="text"
+                  required
+                  value={imapHost}
+                  onChange={(e) => setImapHost(e.target.value)}
+                  placeholder="imap.company.hu"
+                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-imap-port" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">IMAP port</label>
+                <input
+                  id="cfg-imap-port"
+                  type="number"
+                  required
+                  value={imapPort}
+                  onChange={(e) => setImapPort(e.target.value)}
+                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="cfg-smtp-host" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">SMTP szerver</label>
+                <input
+                  id="cfg-smtp-host"
+                  type="text"
+                  required
+                  value={smtpHost}
+                  onChange={(e) => setSmtpHost(e.target.value)}
+                  placeholder="smtp.company.hu"
+                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+              <div>
+                <label htmlFor="cfg-smtp-port" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">SMTP port</label>
+                <input
+                  id="cfg-smtp-port"
+                  type="number"
+                  required
+                  value={smtpPort}
+                  onChange={(e) => setSmtpPort(e.target.value)}
+                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                />
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 disabled:opacity-55"
+            >
+              {isLoading ? 'Mentés…' : 'Konfiguráció mentése'}
+            </button>
+          </form>
+        )}
+
+        {/* Manual Sync Button */}
+        {isConnected && connectedProvider && connectedProvider !== 'google' && (
+          <div className="border-t border-slate-800/80 pt-5">
+            <button
+              type="button"
+              onClick={handleManualSync}
+              disabled={isSyncing}
+              className="flex items-center gap-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-5 py-2.5 text-xs font-semibold text-indigo-400 hover:bg-indigo-500/20 transition-all active:scale-95 disabled:opacity-55"
+            >
+              {isSyncing ? (
+                <>
+                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-indigo-400/30 border-t-indigo-400" />
+                  Szinkronizálás…
+                </>
+              ) : (
+                <>
+                  <Mail className="h-3.5 w-3.5" />
+                  Levelek szinkronizálása
+                </>
+              )}
+            </button>
+            <p className="mt-1.5 text-[10px] text-slate-600">
+              Az automatikus szinkronizáció 5 percenként fut a háttérben.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ─── MfaSettingsCard ─────────────────────────────────────────────────────────
+
 
 function MfaSettingsCard() {
   const [isMfaEnrolled, setIsMfaEnrolled] = useState(false)
@@ -1332,13 +1676,14 @@ export default function App() {
   const [view, setView] = useState<AppView>('login')
   const [userEmail, setUserEmail] = useState<string | null>(null)
   const [subscriptionStatus, setSubscriptionStatus] = useState<string>('none')
-  const [devBypass, setDevBypass] = useState(false)
+  const [processedEmailsThisMonth, setProcessedEmailsThisMonth] = useState<number>(0)
+  const [tier, setTier] = useState<string>('basic')
   const [tasks, setTasks] = useState<Task[]>([])
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('Összes')
   const [completingIds, setCompletingIds] = useState<Set<string>>(new Set())
   const [toasts, setToasts] = useState<Toast[]>([])
 
-  const hasAccess = subscriptionStatus === 'active' || devBypass
+  const hasAccess = subscriptionStatus === 'active'
 
   // AI automation states
   const [activeTab, setActiveTab] = useState<'tasks' | 'automation'>('tasks')
@@ -1388,12 +1733,18 @@ export default function App() {
       if (docSnap.exists()) {
         const data = docSnap.data()
         setSubscriptionStatus(data?.subscriptionStatus === 'active' ? 'active' : 'none')
+        setProcessedEmailsThisMonth(data?.processedEmailsThisMonth ?? 0)
+        setTier(data?.tier ?? 'basic')
       } else {
         setSubscriptionStatus('none')
+        setProcessedEmailsThisMonth(0)
+        setTier('basic')
       }
     }, (error) => {
       console.error('Error fetching subscription status:', error)
       setSubscriptionStatus('none')
+      setProcessedEmailsThisMonth(0)
+      setTier('basic')
     })
 
     return () => unsubscribe()
@@ -1416,7 +1767,6 @@ export default function App() {
     }
     setUserEmail(null)
     setSubscriptionStatus('none')
-    setDevBypass(false)
     setView('login')
     setCategoryFilter('Összes')
     setCompletingIds(new Set())
@@ -1434,10 +1784,6 @@ export default function App() {
     } catch (err) {
       console.error('Error starting subscription:', err)
     }
-  }
-
-  const handleDevBypass = () => {
-    setDevBypass(true)
   }
 
   const handleCompleteTask = async (id: string) => {
@@ -1602,7 +1948,6 @@ export default function App() {
         <PaywallView
           userEmail={userEmail}
           onSubscribe={handleSubscribe}
-          onDevBypass={handleDevBypass}
           onLogout={handleLogout}
         />
       )}
@@ -1622,6 +1967,8 @@ export default function App() {
           promptRules={promptRules}
           onSaveAutomation={handleSaveAutomation}
           onOpenFeedback={() => setIsFeedbackOpen(true)}
+          processedEmailsThisMonth={processedEmailsThisMonth}
+          tier={tier}
         />
       )}
 

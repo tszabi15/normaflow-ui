@@ -5,12 +5,14 @@ interface AutoResponderProps {
   initialEnabled: boolean
   initialRules: string
   onSave: (rules: string, enabled: boolean) => Promise<void> | void
+  limitExceeded?: boolean
 }
 
 export default function AutoResponder({
   initialEnabled,
   initialRules,
   onSave,
+  limitExceeded = false,
 }: AutoResponderProps) {
   const [rules, setRules] = useState(initialRules)
   const [isEnabled, setIsEnabled] = useState(initialEnabled)
@@ -19,8 +21,8 @@ export default function AutoResponder({
   // Sync state if props change (though usually local state controls this)
   useEffect(() => {
     setRules(initialRules)
-    setIsEnabled(initialEnabled)
-  }, [initialRules, initialEnabled])
+    setIsEnabled(initialEnabled && !limitExceeded)
+  }, [initialRules, initialEnabled, limitExceeded])
 
   const handleSave = async () => {
     setIsSaving(true)
@@ -57,25 +59,25 @@ export default function AutoResponder({
             <button
               type="button"
               onClick={() => setIsEnabled(!isEnabled)}
-              disabled={isSaving}
+              disabled={isSaving || limitExceeded}
               className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-slate-900 ${
-                isEnabled ? 'bg-indigo-600' : 'bg-slate-700'
-              }`}
-              aria-checked={isEnabled}
+                isEnabled && !limitExceeded ? 'bg-indigo-600' : 'bg-slate-700'
+              } ${limitExceeded ? 'opacity-45 cursor-not-allowed' : ''}`}
+              aria-checked={isEnabled && !limitExceeded}
               role="switch"
             >
               <span
                 className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                  isEnabled ? 'translate-x-5' : 'translate-x-0'
+                  isEnabled && !limitExceeded ? 'translate-x-5' : 'translate-x-0'
                 }`}
               />
             </button>
             <span
               className={`text-xs font-bold uppercase ${
-                isEnabled ? 'text-indigo-400' : 'text-slate-500'
+                limitExceeded ? 'text-rose-400' : (isEnabled ? 'text-indigo-400' : 'text-slate-500')
               }`}
             >
-              {isEnabled ? 'BE' : 'KI'}
+              {limitExceeded ? 'LIMIT ELÉRVE' : (isEnabled ? 'BE' : 'KI')}
             </span>
           </div>
         </div>

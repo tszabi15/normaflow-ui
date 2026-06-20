@@ -1,9 +1,12 @@
 import { setGlobalOptions } from "firebase-functions/v2";
 import { onRequest } from "firebase-functions/v2/https";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
 import { OpenAI } from "openai";
+import { ImapFlow } from "imapflow";
+import * as nodemailer from "nodemailer";
 
 // Set global options for the functions (max instances for budget/cost control)
 setGlobalOptions({ maxInstances: 10 });
@@ -11,6 +14,8 @@ setGlobalOptions({ maxInstances: 10 });
 // Initialize Firebase Admin
 admin.initializeApp();
 const db = getFirestore();
+
+// ─── Interfaces ──────────────────────────────────────────────────────────────
 
 interface IncomingEmailRequest {
   sender: string;
@@ -25,6 +30,76 @@ interface FeedbackSubmitRequest {
   category: string;
   description?: string;
   user_email: string;
+}
+
+interface EmailConfig {
+  provider: "google" | "outlook" | "custom";
+  email: string;
+  password?: string;
+  imapHost?: string;
+  imapPort?: number;
+  smtpHost?: string;
+  smtpPort?: number;
+  connected_at: string;
+}
+
+interface SendAiReplyRequest {
+  taskId: string;
+  replyBody: string;
+  recipientEmail: string;
+}
+
+// ─── Shared Helpers ──────────────────────────────────────────────────────────
+
+/** Extract clean email from "Name <email@domain.com>" or "email@domain.com" */
+function extractEmail(sender: string): string {
+  const match = sender.match(/<([^>]+)>/);
+  return match ? match[1].trim().toLowerCase() : sender.trim().toLowerCase();
+}
+
+/** Extract and verify JWT from Authorization header */
+async function verifyAuthToken(req: any): Promise<{ email: string } | null> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+  const idToken = authHeader.split("Bearer ")[1];
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    return decoded.email ? { email: decoded.email } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Check if a user has an active subscription */
+async function checkSubscription(userEmail: string): Promise<boolean> {
+  const userDoc = await db.collection("users").doc(userEmail).get();
+  return userDoc.exists && userDoc.data()?.subscriptionStatus === "active";
+}
+
+/** Spam filter: returns true if the sender should be blocked */
+function isSpamSender(sender: string): boolean {
+  const senderLower = sender.toLowerCase();
+  const parts = senderLower.split("@");
+  const localPart = parts[0] || "";
+  return localPart === "noreply" || localPart === "newsletter" || senderLower.includes("spam");
+}
+
+/** Resolve IMAP/SMTP config for a provider type */
+function resolveEmailServers(config: EmailConfig): { imapHost: string; imapPort: number; smtpHost: string; smtpPort: number } {
+  if (config.provider === "outlook") {
+    return {
+      imapHost: config.imapHost || "imap-mail.outlook.com",
+      imapPort: config.imapPort || 993,
+      smtpHost: config.smtpHost || "smtp-mail.outlook.com",
+      smtpPort: config.smtpPort || 587,
+    };
+  }
+  return {
+    imapHost: config.imapHost || "localhost",
+    imapPort: config.imapPort || 993,
+    smtpHost: config.smtpHost || "localhost",
+    smtpPort: config.smtpPort || 587,
+  };
 }
 
 /**
@@ -80,13 +155,46 @@ export const handleIncomingEmail = onRequest({
 
     // Subscription check: verify user has an active subscription
     const userDoc = await db.collection("users").doc(targetEmail).get();
-    if (!userDoc.exists || userDoc.data()?.subscriptionStatus !== "active") {
+    const userData = userDoc.exists ? userDoc.data() : null;
+    if (!userData || userData.subscriptionStatus !== "active") {
       logger.warn(`Forbidden request to handleIncomingEmail: user ${targetEmail} does not have an active subscription`);
       res.status(403).json({
         error: "Forbidden: Account requires an active subscription to process background email automation."
       });
       return;
     }
+
+    // Quota evaluation
+    const processedEmailsThisMonth = userData.processedEmailsThisMonth || 0;
+    const tier = userData.tier || "basic";
+    const tierLimits: Record<string, number> = {
+      basic: 500,
+      pro: 1500,
+      ultra: 5000,
+    };
+    const limit = tierLimits[tier] || 500;
+    if (processedEmailsThisMonth >= limit) {
+      logger.warn(`Quota exceeded for user ${targetEmail}: ${processedEmailsThisMonth} >= ${limit}`);
+      res.status(403).json({
+        error: "Forbidden: Monthly email processing limit reached for current subscription tier."
+      });
+      return;
+    }
+
+    // Whitelist Enforcement
+    const senderEmail = extractEmail(sender);
+    const clientsSnap = await db.collection("users")
+      .doc(targetEmail)
+      .collection("clients")
+      .where("email", "==", senderEmail)
+      .get();
+
+    if (clientsSnap.empty) {
+      logger.info(`Whitelisting: Sender ${senderEmail} is not a registered client of ${targetEmail}. Skipping processing.`);
+      res.status(200).json({ status: "skipped", message: "Sender is not whitelisted in accountant's clients." });
+      return;
+    }
+
 
     // Step B: Fetch Accountant's Custom Rules
     logger.info(`Fetching auto-responder settings for userEmail: ${targetEmail}`);
@@ -147,6 +255,11 @@ export const handleIncomingEmail = onRequest({
     logger.info("Saving new task to Firestore...");
     const taskDocRef = await db.collection("tasks").add(taskPayload);
     logger.info(`Successfully created task with ID: ${taskDocRef.id}`);
+
+    // Increment processed email count
+    await db.collection("users").doc(targetEmail).update({
+      processedEmailsThisMonth: admin.firestore.FieldValue.increment(1)
+    });
 
     res.status(200).json({
       status: "success",
@@ -262,5 +375,393 @@ export const handleFeedbackSubmit = onRequest({
       error: "Internal Server Error",
       message: errorMessage,
     });
+  }
+});
+
+// ─── SUBSYSTEM 3: syncEmails (Scheduled IMAP Sync) ───────────────────────────
+
+/**
+ * Runs every 5 minutes. For each active subscriber with an Outlook or Custom
+ * email_config, connects via IMAP, fetches unread messages, runs the AI engine,
+ * and pushes tasks to Firestore. Google users are skipped (handled by webhook).
+ */
+async function performEmailSync(targetEmail: string): Promise<number> {
+  let synced = 0;
+
+  // Load user details
+  const userDoc = await db.collection("users").doc(targetEmail).get();
+  const userData = userDoc.exists ? userDoc.data() : null;
+  if (!userData || userData.subscriptionStatus !== "active") {
+    logger.warn(`performEmailSync: User ${targetEmail} does not have an active subscription.`);
+    return 0;
+  }
+
+  let processedEmailsThisMonth = userData.processedEmailsThisMonth || 0;
+  const tier = userData.tier || "basic";
+  const tierLimits: Record<string, number> = {
+    basic: 500,
+    pro: 1500,
+    ultra: 5000,
+  };
+  const limit = tierLimits[tier] || 500;
+
+  if (processedEmailsThisMonth >= limit) {
+    logger.warn(`performEmailSync: User ${targetEmail} already reached their monthly limit.`);
+    return 0;
+  }
+
+  // Load email config
+  const configDoc = await db.doc(`users/${targetEmail}/tokens/email_config`).get();
+  if (!configDoc.exists) return 0;
+  const config = configDoc.data() as EmailConfig;
+
+  // Google users rely on the webhook pipeline, skip IMAP sync
+  if (config.provider === "google" || !config.password) return 0;
+
+  const servers = resolveEmailServers(config);
+
+  // Load auto-responder rules
+  const rulesDoc = await db.doc(`users/${targetEmail}/settings/auto_responder`).get();
+  let automationEnabled = false;
+  let promptRules = "";
+  if (rulesDoc.exists) {
+    const data = rulesDoc.data();
+    automationEnabled = !!data?.automationEnabled;
+    promptRules = data?.promptRules || "";
+  }
+
+
+  // Connect to IMAP
+  const client = new ImapFlow({
+    host: servers.imapHost,
+    port: servers.imapPort,
+    secure: true,
+    auth: {
+      user: config.email,
+      pass: config.password,
+    },
+    logger: false,
+  });
+
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock("INBOX");
+
+    try {
+      // Fetch unseen messages
+      const messages = client.fetch({ seen: false }, { source: true, envelope: true });
+
+      for await (const msg of messages) {
+        const envelope = msg.envelope;
+        if (!envelope) continue;
+        const sender = envelope.from?.[0]?.address || "";
+        const subject = envelope.subject || "";
+        const rawSource = msg.source?.toString("utf-8") || "";
+
+        // Quota check inside loop
+        if (processedEmailsThisMonth >= limit) {
+          logger.warn(`performEmailSync: User ${targetEmail} reached limit of ${limit}. Aborting sync loop.`);
+          break;
+        }
+
+        // Whitelist check
+        const senderEmail = extractEmail(sender);
+        const clientsSnap = await db.collection("users")
+          .doc(targetEmail)
+          .collection("clients")
+          .where("email", "==", senderEmail)
+          .get();
+
+        if (clientsSnap.empty) {
+          logger.info(`performEmailSync: Whitelist check failed for sender ${senderEmail}. Skipping.`);
+          if (msg.uid) {
+            await client.messageFlagsAdd({ uid: msg.uid }, ["\\Seen"], { uid: true });
+          }
+          continue;
+        }
+
+        // Extract plain text body (simple extraction from raw source)
+        let textContent = "";
+        const boundaryMatch = rawSource.match(/boundary="?([^"\r\n]+)"?/);
+        if (boundaryMatch) {
+          // Multipart: find text/plain part
+          const parts = rawSource.split(boundaryMatch[1]);
+          for (const part of parts) {
+            if (part.includes("text/plain")) {
+              const bodyStart = part.indexOf("\r\n\r\n");
+              if (bodyStart !== -1) {
+                textContent = part.substring(bodyStart + 4).trim();
+                break;
+              }
+            }
+          }
+        } else {
+          // Simple message: body after double newline
+          const bodyStart = rawSource.indexOf("\r\n\r\n");
+          textContent = bodyStart !== -1 ? rawSource.substring(bodyStart + 4).trim() : rawSource;
+        }
+
+        // Spam filter
+        if (!sender || isSpamSender(sender) || textContent.length < 20) {
+          logger.info(`syncEmails: Filtered email from ${sender} for user ${targetEmail}`);
+          continue;
+        }
+
+        // AI Engine
+        let aiReply: string | null = null;
+        if (automationEnabled && promptRules.trim() && process.env.OPENAI_API_KEY) {
+          try {
+            const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+            const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy a beérkező e-mailre generálj egy hivatalos, udvarias választervezetet a könyvelő által meghatározott egyedi szabályok alapján.\n\nKönyvelő egyedi szabályai:\n${promptRules}`;
+            const userPrompt = `Feladó: ${sender}\nTárgy: ${subject || "Nincs tárgy megadva"}\nÜzenet:\n${textContent.substring(0, 2000)}`;
+
+            const response = await openai.chat.completions.create({
+              model: "gpt-4o-mini",
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt },
+              ],
+              max_tokens: 400,
+            });
+            aiReply = response.choices[0]?.message?.content || null;
+          } catch (aiErr) {
+            logger.error(`syncEmails: AI error for ${targetEmail}:`, aiErr);
+          }
+        }
+
+        // Push task to Firestore
+        const aiStatus = aiReply ? "sent" : "idle";
+        const nextStep = aiReply ? "AI választervezet felülvizsgálata" : "Manuális válasz írása szükséges";
+
+        await db.collection("tasks").add({
+          category: "E-mail",
+          summary: subject || "Nincs tárgy megadva",
+          next_step: nextStep,
+          priority: 3,
+          received_at: new Date().toISOString(),
+          sender,
+          subject: subject || "",
+          user_email: targetEmail,
+          status: "pending",
+          ai_status: aiStatus,
+          ai_reply: aiReply,
+          source_provider: config.provider,
+        });
+
+        // Increment processed email count
+        await db.collection("users").doc(targetEmail).update({
+          processedEmailsThisMonth: admin.firestore.FieldValue.increment(1)
+        });
+        processedEmailsThisMonth++;
+
+        // Mark as seen
+        if (msg.uid) {
+          await client.messageFlagsAdd({ uid: msg.uid }, ["\\Seen"], { uid: true });
+        }
+
+        synced++;
+      }
+    } finally {
+      lock.release();
+    }
+
+    await client.logout();
+  } catch (err) {
+    logger.error(`syncEmails: IMAP error for ${targetEmail}:`, err);
+    try { await client.logout(); } catch { /* ignore */ }
+  }
+
+  return synced;
+}
+
+export const syncEmails = onSchedule({
+  schedule: "every 5 minutes",
+  secrets: ["OPENAI_API_KEY"],
+  timeoutSeconds: 300,
+}, async () => {
+  logger.info("syncEmails: Starting scheduled email sync...");
+
+  // Find all active subscribers
+  const usersSnap = await db.collection("users")
+    .where("subscriptionStatus", "==", "active")
+    .get();
+
+  let totalSynced = 0;
+  for (const userDoc of usersSnap.docs) {
+    const userEmail = userDoc.id;
+    try {
+      const count = await performEmailSync(userEmail);
+      if (count > 0) {
+        logger.info(`syncEmails: Synced ${count} emails for ${userEmail}`);
+        totalSynced += count;
+      }
+    } catch (err) {
+      logger.error(`syncEmails: Failed for ${userEmail}:`, err);
+    }
+  }
+
+  logger.info(`syncEmails: Completed. Total synced: ${totalSynced}`);
+});
+
+// ─── SUBSYSTEM 4: syncEmailsNow (Manual Trigger) ────────────────────────────
+
+/**
+ * HTTPS endpoint for on-demand email sync.
+ * Called by the frontend "Levelek szinkronizálása" button.
+ * JWT-authenticated + subscription-gated.
+ */
+export const syncEmailsNow = onRequest({
+  cors: true,
+  secrets: ["OPENAI_API_KEY"],
+  maxInstances: 5,
+  invoker: "public",
+}, async (req, res) => {
+  try {
+    if (req.method === "OPTIONS") {
+      res.set("Access-Control-Allow-Origin", "*");
+      res.set("Access-Control-Allow-Methods", "POST");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.status(204).send("");
+      return;
+    }
+
+    // Auth
+    const authResult = await verifyAuthToken(req);
+    if (!authResult) {
+      res.status(401).send("Unauthorized");
+      return;
+    }
+
+    // Subscription check
+    if (!(await checkSubscription(authResult.email))) {
+      res.status(403).send("Forbidden: Active subscription required");
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed. Must be POST." });
+      return;
+    }
+
+    logger.info(`syncEmailsNow: Manual sync triggered by ${authResult.email}`);
+    const count = await performEmailSync(authResult.email);
+
+    res.status(200).json({
+      status: "success",
+      synced: count,
+      message: count > 0 ? `${count} új e-mail szinkronizálva.` : "Nincs új e-mail.",
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error("syncEmailsNow error:", errorMessage);
+    res.status(500).json({ error: "Internal Server Error", message: errorMessage });
+  }
+});
+
+// ─── SUBSYSTEM 5: sendAiReply (SMTP Email Sender) ───────────────────────────
+
+/**
+ * Sends the AI-generated reply as a real email via the accountant's
+ * corporate SMTP server. JWT-authenticated + subscription-gated.
+ * Input: { taskId, replyBody, recipientEmail }
+ */
+export const sendAiReply = onRequest({
+  cors: true,
+  maxInstances: 5,
+  invoker: "public",
+}, async (req, res) => {
+  try {
+    if (req.method === "OPTIONS") {
+      res.set("Access-Control-Allow-Origin", "*");
+      res.set("Access-Control-Allow-Methods", "POST");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.status(204).send("");
+      return;
+    }
+
+    // Auth
+    const authResult = await verifyAuthToken(req);
+    if (!authResult) {
+      res.status(401).send("Unauthorized");
+      return;
+    }
+
+    // Subscription check
+    if (!(await checkSubscription(authResult.email))) {
+      res.status(403).send("Forbidden: Active subscription required");
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed. Must be POST." });
+      return;
+    }
+
+    const { taskId, replyBody, recipientEmail } = req.body as Partial<SendAiReplyRequest>;
+    if (!taskId || !replyBody || !recipientEmail) {
+      res.status(400).json({ error: "Missing required fields: taskId, replyBody, recipientEmail." });
+      return;
+    }
+
+    // Load email config
+    const configDoc = await db.doc(`users/${authResult.email}/tokens/email_config`).get();
+    if (!configDoc.exists) {
+      res.status(400).json({ error: "No email configuration found. Please connect your email first." });
+      return;
+    }
+    const config = configDoc.data() as EmailConfig;
+
+    if (config.provider === "google") {
+      res.status(400).json({ error: "Google email replies are handled via the Gmail API. Use the Gmail interface." });
+      return;
+    }
+
+    if (!config.password) {
+      res.status(400).json({ error: "Missing email credentials. Please reconfigure your email connection." });
+      return;
+    }
+
+    const servers = resolveEmailServers(config);
+
+    // Load original task for subject threading
+    const taskDoc = await db.collection("tasks").doc(taskId).get();
+    const taskData = taskDoc.exists ? taskDoc.data() : null;
+    const originalSubject = taskData?.subject || "Nincs tárgy";
+
+    // Create nodemailer transport
+    const transporter = nodemailer.createTransport({
+      host: servers.smtpHost,
+      port: servers.smtpPort,
+      secure: servers.smtpPort === 465,
+      auth: {
+        user: config.email,
+        pass: config.password,
+      },
+    });
+
+    // Send email
+    await transporter.sendMail({
+      from: config.email,
+      to: recipientEmail,
+      subject: `Re: ${originalSubject}`,
+      text: replyBody,
+    });
+
+    // Update task status
+    await db.collection("tasks").doc(taskId).update({
+      ai_status: "sent",
+      sent_at: new Date().toISOString(),
+    });
+
+    logger.info(`sendAiReply: Email sent by ${authResult.email} to ${recipientEmail} for task ${taskId}`);
+
+    res.status(200).json({
+      status: "success",
+      message: "E-mail sikeresen elküldve.",
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error("sendAiReply error:", errorMessage);
+    res.status(500).json({ error: "Internal Server Error", message: errorMessage });
   }
 });

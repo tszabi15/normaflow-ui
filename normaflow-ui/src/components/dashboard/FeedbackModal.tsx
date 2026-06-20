@@ -51,6 +51,7 @@ export default function FeedbackModal({
           title: title.trim(),
           category: mappedCategory,
           description: description.trim(),
+          user_email: userEmail,
         }),
       })
 
