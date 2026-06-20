@@ -1096,7 +1096,6 @@ export const restoreTask = onRequest({ cors: true }, async (req, res) => {
     await taskRef.update({
       status: "active",
       archivedAt: null,
-      ai_status: "pending_review",
     });
 
     res.status(200).json({ status: "success", taskId });

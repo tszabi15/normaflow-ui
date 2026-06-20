@@ -14,7 +14,6 @@ import {
   X,
   Sparkles,
   Lightbulb,
-  Phone,
   ShieldAlert,
   Trash2,
   Plus,
@@ -25,26 +24,26 @@ import type { Task, TaskCategory, TaskPriority } from './types/task'
 import AutoResponder from './components/dashboard/AutoResponder'
 import FeedbackModal from './components/dashboard/FeedbackModal'
 import { db, auth } from './firebase'
-import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc } from 'firebase/firestore'
+import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc, runTransaction } from 'firebase/firestore'
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   signOut,
   onAuthStateChanged,
   multiFactor,
-  PhoneAuthProvider,
-  PhoneMultiFactorGenerator,
-  RecaptchaVerifier,
   getMultiFactorResolver,
+  TotpMultiFactorGenerator,
   GoogleAuthProvider,
   signInWithPopup,
+  type MultiFactorResolver,
+  type TotpSecret,
 } from 'firebase/auth'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type CategoryFilter = TaskCategory | 'Összes'
 
-type AppView = 'login' | 'paywall' | 'dashboard'
+type SubscriptionTier = 'basic' | 'pro' | 'ultra'
 
 interface Toast {
   id: string
@@ -54,7 +53,43 @@ interface Toast {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const DEMO_USER_EMAIL = 'kovacs.kata@normaflow.hu'
+const TIER_LIMITS: Record<SubscriptionTier, number> = {
+  basic: 500,
+  pro: 1500,
+  ultra: 5000,
+}
+
+const PRICING_PLANS: {
+  tier: SubscriptionTier
+  name: string
+  price: string
+  emails: number
+  features: string[]
+  highlighted?: boolean
+}[] = [
+  {
+    tier: 'basic',
+    name: 'Basic',
+    price: '9.990',
+    emails: 500,
+    features: ['500 e-mail / hó', 'AI feladat összegzés', 'Prioritás-sorrendezés', '30 napos kuka'],
+  },
+  {
+    tier: 'pro',
+    name: 'Pro',
+    price: '19.990',
+    emails: 1500,
+    features: ['1500 e-mail / hó', 'AI auto-választervezet', 'Ügyfél fehérlista', 'Prioritás riasztások'],
+    highlighted: true,
+  },
+  {
+    tier: 'ultra',
+    name: 'Ultra',
+    price: '39.990',
+    emails: 5000,
+    features: ['5000 e-mail / hó', 'Teljes automatizáció', 'Dedikált támogatás', 'Audit napló'],
+  },
+]
 
 const CATEGORIES: TaskCategory[] = [
   'NAV / Hivatalos',
@@ -172,18 +207,36 @@ function ToastNotification({
   )
 }
 
+async function ensureUserDocument(email: string): Promise<void> {
+  const userRef = doc(db, 'users', email)
+  const snap = await getDoc(userRef)
+  if (!snap.exists()) {
+    await setDoc(userRef, {
+      email,
+      subscriptionStatus: 'none',
+      tier: 'basic',
+      processedEmailsThisMonth: 0,
+      createdAt: new Date().toISOString(),
+    })
+  }
+}
+
 // ─── LoginView ───────────────────────────────────────────────────────────────
 
-function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
+function LoginView({ onAuthenticated }: { onAuthenticated: () => void }) {
   const [isLoading, setIsLoading] = useState(false)
   const [isSignUp, setIsSignUp] = useState(false)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [mfaRequired, setMfaRequired] = useState(false)
   const [mfaCode, setMfaCode] = useState('')
-  const [mfaVerificationId, setMfaVerificationId] = useState('')
-  const [resolver, setResolver] = useState<any>(null)
+  const [resolver, setResolver] = useState<MultiFactorResolver | null>(null)
   const [error, setError] = useState('')
+
+  const completeSignIn = async (signedInEmail: string) => {
+    await ensureUserDocument(signedInEmail)
+    onAuthenticated()
+  }
 
   const handleEmailPasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -193,31 +246,17 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
     try {
       if (isSignUp) {
         const userCredential = await createUserWithEmailAndPassword(auth, email, password)
-        onLogin(userCredential.user.email || '')
+        await ensureUserDocument(userCredential.user.email || email)
+        onAuthenticated()
       } else {
         const userCredential = await signInWithEmailAndPassword(auth, email, password)
-        onLogin(userCredential.user.email || '')
+        await completeSignIn(userCredential.user.email || email)
       }
     } catch (err: any) {
       if (err.code === 'auth/multi-factor-auth-required') {
         const mfaResolver = getMultiFactorResolver(auth, err)
         setResolver(mfaResolver)
         setMfaRequired(true)
-        try {
-          const verifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
-            size: 'invisible'
-          })
-          const phoneInfoOptions = {
-            multiFactorHint: mfaResolver.hints[0],
-            session: mfaResolver.session
-          }
-          const phoneAuthProvider = new PhoneAuthProvider(auth)
-          const vId = await phoneAuthProvider.verifyPhoneNumber(phoneInfoOptions, verifier)
-          setMfaVerificationId(vId)
-        } catch (recaptchaErr: any) {
-          console.error('Recaptcha/Verification error:', recaptchaErr)
-          setError('Nem sikerült elküldeni a 2FA ellenőrző kódot: ' + recaptchaErr.message)
-        }
       } else {
         let errMsg = err.message
         if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
@@ -236,16 +275,16 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
 
   const handleVerifyMfaCode = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!resolver || !mfaVerificationId || !mfaCode) return
+    if (!resolver || !mfaCode.trim()) return
     setIsLoading(true)
     setError('')
     try {
-      const cred = PhoneAuthProvider.credential(mfaVerificationId, mfaCode)
-      const assertion = PhoneMultiFactorGenerator.assertion(cred)
+      const uid = resolver.hints[0].uid
+      const assertion = TotpMultiFactorGenerator.assertionForSignIn(uid, mfaCode.trim())
       const userCredential = await resolver.resolveSignIn(assertion)
-      onLogin(userCredential.user.email || '')
+      await completeSignIn(userCredential.user.email || '')
     } catch (err: any) {
-      setError(err.message || 'Érvénytelen 2FA ellenőrző kód.')
+      setError(err.message || 'Érvénytelen hitelesítő kód.')
     } finally {
       setIsLoading(false)
     }
@@ -257,16 +296,90 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
     try {
       const provider = new GoogleAuthProvider()
       const result = await signInWithPopup(auth, provider)
-      onLogin(result.user.email || '')
+      await ensureUserDocument(result.user.email || '')
+      onAuthenticated()
     } catch (err: any) {
-      console.warn("Google authentication popup error, falling back to demo session:", err)
-      setTimeout(() => {
-        onLogin(DEMO_USER_EMAIL)
-        setIsLoading(false)
-      }, 1000)
+      if (err.code === 'auth/multi-factor-auth-required') {
+        const mfaResolver = getMultiFactorResolver(auth, err)
+        setResolver(mfaResolver)
+        setMfaRequired(true)
+      } else if (err.code === 'auth/popup-closed-by-user') {
+        setError('A Google bejelentkezés megszakítva.')
+      } else {
+        setError(err.message || 'Google bejelentkezés sikertelen.')
+      }
     } finally {
       setIsLoading(false)
     }
+  }
+
+  if (mfaRequired) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 p-6">
+        <div className="absolute inset-0 overflow-hidden">
+          <div className="absolute left-1/2 top-1/3 h-64 w-64 -translate-x-1/2 rounded-full bg-indigo-600/10 blur-3xl" />
+        </div>
+        <div className="relative w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900/90 p-8 shadow-2xl backdrop-blur-sm">
+          <div className="mb-6 flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-600">
+              <Shield className="h-5 w-5 text-white" />
+            </div>
+            <div>
+              <h2 className="text-xl font-bold text-white">Kétfaktoros Hitelesítés</h2>
+              <p className="text-sm text-slate-400">Adja meg a 6 jegyű kódot az Authenticator alkalmazásból.</p>
+            </div>
+          </div>
+
+          {error && (
+            <div className="mb-4 rounded-lg border border-red-500/20 bg-red-500/15 p-3 text-xs font-medium text-red-400">
+              {error}
+            </div>
+          )}
+
+          <form onSubmit={handleVerifyMfaCode} className="space-y-4">
+            <div>
+              <label htmlFor="mfa-code" className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                Hitelesítő kód
+              </label>
+              <input
+                id="mfa-code"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                maxLength={6}
+                required
+                autoFocus
+                value={mfaCode}
+                onChange={(e) => setMfaCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="000000"
+                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3.5 text-center text-lg tracking-[0.4em] text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoading || mfaCode.length !== 6}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-indigo-900/30 transition-all hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isLoading ? 'Ellenőrzés…' : 'Bejelentkezés megerősítése'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setMfaRequired(false)
+                setResolver(null)
+                setMfaCode('')
+                setError('')
+              }}
+              className="w-full text-center text-xs text-indigo-400 hover:underline"
+            >
+              Vissza a bejelentkezéshez
+            </button>
+          </form>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -334,14 +447,12 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
               </span>
             </div>
             <h2 className="text-2xl font-bold text-white">
-              {mfaRequired ? 'Kétlépcsős azonosítás (2FA)' : isSignUp ? 'Regisztráció' : 'Üdvözöljük vissza'}
+              {isSignUp ? 'Regisztráció' : 'Üdvözöljük vissza'}
             </h2>
             <p className="mt-2 text-sm text-slate-400">
-              {mfaRequired 
-                ? 'Küldtünk egy ellenőrző kódot a megadott telefonszámára. Kérjük, írja be a kód mezőbe.'
-                : isSignUp 
-                  ? 'Hozza létre fiókját az intelligens könyvelői felület használatához.'
-                  : 'Jelentkezzen be a munkaterület eléréséhez.'}
+              {isSignUp
+                ? 'Hozza létre fiókját az intelligens könyvelői felület használatához.'
+                : 'Jelentkezzen be a munkaterület eléréséhez.'}
             </p>
 
             {error && (
@@ -350,53 +461,7 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
               </div>
             )}
 
-            <div id="recaptcha-container" className="hidden"></div>
-
-            {mfaRequired ? (
-              <form onSubmit={handleVerifyMfaCode} className="mt-6 space-y-4">
-                <div>
-                  <label htmlFor="mfa-code" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Ellenőrző kód (SMS)
-                  </label>
-                  <input
-                    id="mfa-code"
-                    type="text"
-                    required
-                    value={mfaCode}
-                    onChange={(e) => setMfaCode(e.target.value)}
-                    placeholder="123456"
-                    className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3.5 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isLoading}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-indigo-900/30 transition-all hover:bg-indigo-500 hover:shadow-indigo-800/40 active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {isLoading ? (
-                    <span className="flex items-center gap-2">
-                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-indigo-400 border-t-white" />
-                      Ellenőrzés…
-                    </span>
-                  ) : (
-                    'Kód ellenőrzése'
-                  )}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setMfaRequired(false)
-                    setError('')
-                  }}
-                  className="w-full text-center text-xs text-indigo-400 hover:underline"
-                >
-                  Vissza a bejelentkezéshez
-                </button>
-              </form>
-            ) : (
-              <form onSubmit={handleEmailPasswordSubmit} className="mt-6 space-y-4">
+            <form onSubmit={handleEmailPasswordSubmit} className="mt-6 space-y-4">
                 <div>
                   <label htmlFor="email-input" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
                     E-mail cím
@@ -490,7 +555,6 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
                   </button>
                 </div>
               </form>
-            )}
 
             <p className="mt-6 text-center text-xs text-slate-600">
               A belépéssel elfogadja az{' '}
@@ -506,39 +570,82 @@ function LoginView({ onLogin }: { onLogin: (email: string) => void }) {
   )
 }
 
-// ─── PaywallView ─────────────────────────────────────────────────────────────
+// ─── MfaSetupView ────────────────────────────────────────────────────────────
 
-function PaywallView({
+function MfaSetupView({
   userEmail,
-  onSubscribe,
+  onEnrolled,
   onLogout,
 }: {
   userEmail: string
-  onSubscribe: () => void
+  onEnrolled: () => void
   onLogout: () => void
 }) {
-  const [isCheckingOut, setIsCheckingOut] = useState(false)
+  const [totpSecret, setTotpSecret] = useState<TotpSecret | null>(null)
+  const [secretKey, setSecretKey] = useState('')
+  const [qrCodeUrl, setQrCodeUrl] = useState('')
+  const [verificationCode, setVerificationCode] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const [isInitializing, setIsInitializing] = useState(true)
+  const [error, setError] = useState('')
 
-  const handleCheckout = () => {
-    setIsCheckingOut(true)
-    setTimeout(() => {
-      onSubscribe()
-      setIsCheckingOut(false)
-    }, 1500)
+  useEffect(() => {
+    const initTotp = async () => {
+      setIsInitializing(true)
+      setError('')
+      try {
+        const user = auth.currentUser
+        if (!user) throw new Error('Nincs bejelentkezett felhasználó.')
+        await user.reload()
+        if (multiFactor(user).enrolledFactors.length > 0) {
+          onEnrolled()
+          return
+        }
+        const session = await multiFactor(user).getSession()
+        const secret = await TotpMultiFactorGenerator.generateSecret(session)
+        const qrUrl = secret.generateQrCodeUrl(userEmail, 'NormaFlow')
+        setTotpSecret(secret)
+        setSecretKey(secret.secretKey)
+        setQrCodeUrl(qrUrl)
+      } catch (err: any) {
+        setError(err.message || 'Nem sikerült inicializálni a TOTP beállítást.')
+      } finally {
+        setIsInitializing(false)
+      }
+    }
+    initTotp()
+  }, [userEmail, onEnrolled])
+
+  const handleEnroll = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!totpSecret || verificationCode.length !== 6) return
+    setIsLoading(true)
+    setError('')
+    try {
+      const user = auth.currentUser
+      if (!user) throw new Error('Nincs bejelentkezett felhasználó.')
+      const assertion = TotpMultiFactorGenerator.assertionForEnrollment(totpSecret, verificationCode.trim())
+      await multiFactor(user).enroll(assertion, 'Authenticator App')
+      onEnrolled()
+    } catch (err: any) {
+      setError(err.message || 'Érvénytelen hitelesítő kód. Próbálja újra.')
+    } finally {
+      setIsLoading(false)
+    }
   }
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center bg-slate-950 p-6">
       <div className="absolute inset-0 overflow-hidden">
-        <div className="absolute left-1/2 top-0 h-px w-3/4 -translate-x-1/2 bg-gradient-to-r from-transparent via-indigo-500/30 to-transparent" />
-        <div className="absolute left-1/2 top-1/3 h-64 w-64 -translate-x-1/2 rounded-full bg-indigo-600/5 blur-3xl" />
+        <div className="absolute left-1/4 top-1/4 h-96 w-96 rounded-full bg-indigo-600/5 blur-3xl" />
+        <div className="absolute right-1/4 bottom-1/4 h-64 w-64 rounded-full bg-violet-600/5 blur-3xl" />
       </div>
 
       <div className="relative w-full max-w-lg">
         <div className="mb-6 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600">
-              <Zap className="h-4 w-4 text-white" />
+              <Shield className="h-4 w-4 text-white" />
             </div>
             <span className="font-bold text-white">NormaFlow</span>
           </div>
@@ -555,62 +662,219 @@ function PaywallView({
         <div className="rounded-2xl border border-slate-800 bg-slate-900 p-8 shadow-2xl">
           <div className="mb-6 text-center">
             <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-500/20">
-              <Sparkles className="h-7 w-7 text-indigo-400" />
+              <ShieldAlert className="h-7 w-7 text-indigo-400" />
             </div>
-            <h2 className="text-2xl font-bold text-white">NormaFlow Pro</h2>
-            <p className="mt-1 text-sm text-slate-400">
-              Belépve mint{' '}
-              <span className="text-slate-300">{userEmail}</span>
+            <h2 className="text-2xl font-bold text-white">MFA Biztonsági Beállítás</h2>
+            <p className="mt-2 text-sm text-slate-400">
+              A folytatáshoz kötelező az Authenticator App (TOTP) beállítása.
             </p>
+            <p className="mt-1 text-xs text-slate-500">{userEmail}</p>
           </div>
 
-          <div className="mb-6 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4 text-center">
-            <p className="text-sm text-slate-300 font-medium leading-relaxed">
-              Nincs aktív előfizetése. A NormaFlow SaaS használatához kérjük, válasszon egy előfizetési csomagot.
-            </p>
-          </div>
-
-          <div className="mb-6 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-center">
-            <div className="flex items-baseline justify-center gap-1">
-              <span className="text-3xl font-bold text-white">14.990</span>
-              <span className="text-sm text-slate-400">Ft / hó</span>
+          {error && (
+            <div className="mb-4 rounded-lg border border-red-500/20 bg-red-500/15 p-3 text-xs font-medium text-red-400">
+              {error}
             </div>
+          )}
+
+          {isInitializing ? (
+            <div className="flex flex-col items-center py-12">
+              <span className="h-8 w-8 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent" />
+              <p className="mt-4 text-sm text-slate-400">TOTP kulcs generálása…</p>
+            </div>
+          ) : (
+            <>
+              <div className="mb-6 rounded-xl border border-slate-800 bg-slate-950/60 p-5">
+                <p className="mb-4 text-center text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  1. lépés — QR kód beolvasása
+                </p>
+                <div className="mx-auto flex h-44 w-44 items-center justify-center rounded-xl border border-slate-700 bg-white p-2">
+                  {qrCodeUrl ? (
+                    <img
+                      src={`https://quickchart.io/qr?text=${encodeURIComponent(qrCodeUrl)}&size=160&margin=1`}
+                      alt="TOTP QR kód"
+                      className="h-full w-full object-contain"
+                    />
+                  ) : (
+                    <div className="h-32 w-32 animate-pulse rounded-lg bg-slate-200" />
+                  )}
+                </div>
+                <p className="mt-4 text-center text-[10px] text-slate-500">
+                  Google Authenticator vagy Microsoft Authenticator
+                </p>
+              </div>
+
+              <div className="mb-6 rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  2. lépés — Beállító kulcs (kézi megadás)
+                </p>
+                <code className="block break-all rounded-lg border border-slate-700 bg-slate-900 p-3 text-center text-sm font-mono tracking-wider text-indigo-300">
+                  {secretKey}
+                </code>
+              </div>
+
+              <form onSubmit={handleEnroll} className="space-y-4">
+                <div>
+                  <label htmlFor="enroll-code" className="block text-xs font-semibold uppercase tracking-wider text-slate-400">
+                    3. lépés — 6 jegyű kód ellenőrzése
+                  </label>
+                  <input
+                    id="enroll-code"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    maxLength={6}
+                    required
+                    value={verificationCode}
+                    onChange={(e) => setVerificationCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    placeholder="000000"
+                    className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3.5 text-center text-lg tracking-[0.4em] text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isLoading || verificationCode.length !== 6}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-3.5 text-sm font-semibold text-white transition-all hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isLoading ? 'Aktiválás…' : 'MFA aktiválása és folytatás'}
+                </button>
+              </form>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── PaywallView ─────────────────────────────────────────────────────────────
+
+function PaywallView({
+  userEmail,
+  onSelectTier,
+  onLogout,
+}: {
+  userEmail: string
+  onSelectTier: (tier: SubscriptionTier) => Promise<void>
+  onLogout: () => void
+}) {
+  const [checkingOutTier, setCheckingOutTier] = useState<SubscriptionTier | null>(null)
+  const [error, setError] = useState('')
+
+  const handleSelectPlan = async (tier: SubscriptionTier) => {
+    setCheckingOutTier(tier)
+    setError('')
+    try {
+      await onSelectTier(tier)
+    } catch (err: any) {
+      setError(err.message || 'Nem sikerült aktiválni az előfizetést.')
+    } finally {
+      setCheckingOutTier(null)
+    }
+  }
+
+  return (
+    <div className="flex min-h-screen flex-col items-center justify-center bg-slate-950 p-6">
+      <div className="absolute inset-0 overflow-hidden">
+        <div className="absolute left-1/2 top-0 h-px w-3/4 -translate-x-1/2 bg-gradient-to-r from-transparent via-indigo-500/30 to-transparent" />
+        <div className="absolute left-1/2 top-1/3 h-64 w-64 -translate-x-1/2 rounded-full bg-indigo-600/5 blur-3xl" />
+      </div>
+
+      <div className="relative w-full max-w-5xl">
+        <div className="mb-8 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600">
+              <Zap className="h-4 w-4 text-white" />
+            </div>
+            <span className="font-bold text-white">NormaFlow</span>
           </div>
-
-          <ul className="mb-8 space-y-3">
-            {[
-              'Korlátlan feladat-kezelés',
-              'Valós idejű e-mail stream',
-              'NAV prioritás automatikus kiemelés',
-              'Prioritás-alapú munkalisták',
-              'E-mail előzmények és audit napló',
-            ].map((feature) => (
-              <li key={feature} className="flex items-center gap-3 text-sm text-slate-300">
-                <Check className="h-4 w-4 shrink-0 text-indigo-400" />
-                {feature}
-              </li>
-            ))}
-          </ul>
-
           <button
             type="button"
-            onClick={handleCheckout}
-            disabled={isCheckingOut}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-3.5 text-sm font-semibold text-white transition-all hover:bg-indigo-500 hover:shadow-lg hover:shadow-indigo-900/40 disabled:cursor-not-allowed disabled:opacity-60"
+            onClick={onLogout}
+            className="flex items-center gap-1.5 text-xs text-slate-500 transition-colors hover:text-slate-300"
           >
-            {isCheckingOut ? (
-              <>
-                <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                Átirányítás Stripe Checkout-ra…
-              </>
-            ) : (
-              <>
-                <CreditCard className="h-4 w-4" />
-                Előfizetés indítása
-              </>
-            )}
+            <LogOut className="h-3.5 w-3.5" />
+            Kijelentkezés
           </button>
+        </div>
 
+        <div className="mb-10 text-center">
+          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-500/20">
+            <Sparkles className="h-7 w-7 text-indigo-400" />
+          </div>
+          <h2 className="text-3xl font-bold text-white">Válasszon csomagot</h2>
+          <p className="mt-2 text-sm text-slate-400">
+            Belépve mint <span className="text-slate-300">{userEmail}</span>
+          </p>
+          <p className="mt-3 text-sm text-slate-500">
+            Az alkalmazás használatához aktív előfizetés szükséges.
+          </p>
+        </div>
+
+        {error && (
+          <div className="mb-6 rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-center text-sm text-red-400">
+            {error}
+          </div>
+        )}
+
+        <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+          {PRICING_PLANS.map((plan) => (
+            <div
+              key={plan.tier}
+              className={`relative flex flex-col rounded-2xl border p-6 shadow-xl transition-all ${
+                plan.highlighted
+                  ? 'border-indigo-500/50 bg-gradient-to-b from-indigo-950/40 to-slate-900 ring-1 ring-indigo-500/30'
+                  : 'border-slate-800 bg-slate-900/80'
+              }`}
+            >
+              {plan.highlighted && (
+                <span className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-indigo-600 px-3 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white">
+                  Népszerű
+                </span>
+              )}
+              <h3 className="text-xl font-bold text-white">{plan.name}</h3>
+              <div className="mt-3 flex items-baseline gap-1">
+                <span className="text-3xl font-bold text-white">{plan.price}</span>
+                <span className="text-sm text-slate-400">Ft / hó</span>
+              </div>
+              <p className="mt-2 text-sm font-medium text-indigo-300">
+                {plan.emails.toLocaleString('hu-HU')} e-mail / hó
+              </p>
+
+              <ul className="mt-6 flex-1 space-y-3">
+                {plan.features.map((feature) => (
+                  <li key={feature} className="flex items-start gap-2.5 text-sm text-slate-300">
+                    <Check className="mt-0.5 h-4 w-4 shrink-0 text-indigo-400" />
+                    {feature}
+                  </li>
+                ))}
+              </ul>
+
+              <button
+                type="button"
+                onClick={() => handleSelectPlan(plan.tier)}
+                disabled={checkingOutTier !== null}
+                className={`mt-6 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-60 ${
+                  plan.highlighted
+                    ? 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-lg shadow-indigo-900/40'
+                    : 'border border-slate-700 bg-slate-950 text-slate-200 hover:border-indigo-500/50 hover:bg-slate-900'
+                }`}
+              >
+                {checkingOutTier === plan.tier ? (
+                  <>
+                    <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                    Aktiválás…
+                  </>
+                ) : (
+                  <>
+                    <CreditCard className="h-4 w-4" />
+                    {plan.name} csomag választása
+                  </>
+                )}
+              </button>
+            </div>
+          ))}
         </div>
       </div>
     </div>
@@ -890,7 +1154,8 @@ function MainDashboard({
   onWriteReply: (task: Task) => void
   onRestoreTask: (id: string) => void
 }) {
-  const limit = tier === 'pro' ? 1500 : tier === 'ultra' ? 5000 : 500
+  const limit = TIER_LIMITS[tier as SubscriptionTier] ?? TIER_LIMITS.basic
+  const tierLabel = tier.charAt(0).toUpperCase() + tier.slice(1)
 
   const [taskStatusFilter, setTaskStatusFilter] = useState<'active' | 'archived'>('active')
   const [searchQuery, setSearchQuery] = useState('')
@@ -922,7 +1187,8 @@ function MainDashboard({
         (t.sender && t.sender.toLowerCase().includes(q)) ||
         (t.subject && t.subject.toLowerCase().includes(q)) ||
         (t.textContent && t.textContent.toLowerCase().includes(q)) ||
-        (t.summary && t.summary.toLowerCase().includes(q))
+        (t.summary && t.summary.toLowerCase().includes(q)) ||
+        (t.ai_summary && t.ai_summary.toLowerCase().includes(q))
       )
     }
 
@@ -1001,10 +1267,10 @@ function MainDashboard({
         <div className="px-4 py-4 border-b border-slate-800/60">
           <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-slate-500 mb-1.5">
             <span>Havi keret</span>
-            <span className="text-slate-400 font-bold capitalize">{tier}</span>
+            <span className="text-slate-400 font-bold">{tierLabel}</span>
           </div>
           <div className="flex items-baseline justify-between text-xs text-slate-300 font-medium mb-1">
-            <span>{processedEmailsThisMonth} / {limit} db</span>
+            <span>{processedEmailsThisMonth} / {limit} ({tierLabel})</span>
             <span>{Math.min(100, Math.round((processedEmailsThisMonth / limit) * 100))}%</span>
           </div>
           <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden">
@@ -1219,8 +1485,8 @@ function MainDashboard({
                       : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/30'
                   }`}
                 >
-                  <Trash2 className="h-3.5 w-3.5 animate-pulse text-indigo-400" />
-                  <span>Kuka / Archivált</span>
+                  <Trash2 className="h-3.5 w-3.5 text-indigo-400" />
+                  <span>Kuka</span>
                 </button>
               </div>
 
@@ -1847,124 +2113,19 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
 
 // ─── MfaSettingsCard ─────────────────────────────────────────────────────────
 
-
 function MfaSettingsCard() {
   const [isMfaEnrolled, setIsMfaEnrolled] = useState(false)
-  const [enrolledPhone, setEnrolledPhone] = useState('')
-  const [isEnrolling, setIsEnrolling] = useState(false)
-  const [phoneNumber, setPhoneNumber] = useState('')
-  const [verificationCode, setVerificationCode] = useState('')
-  const [verificationId, setVerificationId] = useState('')
-  const [isLoading, setIsLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [success, setSuccess] = useState('')
-
-  const refreshMfaStatus = () => {
-    const currentUser = auth.currentUser
-    if (currentUser) {
-      const mfaUser = multiFactor(currentUser)
-      const factors = mfaUser.enrolledFactors
-      if (factors.length > 0) {
-        setIsMfaEnrolled(true)
-        const phoneFactor = factors[0] as any
-        setEnrolledPhone(phoneFactor.phoneNumber || 'Aktív telefonszám')
-      } else {
-        setIsMfaEnrolled(false)
-        setEnrolledPhone('')
-      }
-    }
-  }
 
   useEffect(() => {
-    refreshMfaStatus()
+    const user = auth.currentUser
+    if (user) {
+      setIsMfaEnrolled(multiFactor(user).enrolledFactors.length > 0)
+    }
   }, [])
-
-  const handleStartEnroll = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!phoneNumber.trim()) return
-    setIsLoading(true)
-    setError('')
-    setSuccess('')
-    try {
-      const currentUser = auth.currentUser
-      if (!currentUser) throw new Error('Nem található bejelentkezett felhasználó.')
-
-      const session = await multiFactor(currentUser).getSession()
-      const phoneInfoOptions = {
-        phoneNumber: phoneNumber.trim(),
-        session: session,
-      }
-      const phoneAuthProvider = new PhoneAuthProvider(auth)
-      const verifier = new RecaptchaVerifier(auth, 'recaptcha-container-enroll', {
-        size: 'invisible',
-      })
-      const vId = await phoneAuthProvider.verifyPhoneNumber(phoneInfoOptions, verifier)
-      setVerificationId(vId)
-      setIsEnrolling(true)
-      setSuccess('Ellenőrző kód elküldve SMS-ben!')
-    } catch (err: any) {
-      console.error(err)
-      setError(err.message || 'Hiba történt a 2FA folyamat elindításakor.')
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  const handleFinishEnroll = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!verificationCode.trim() || !verificationId) return
-    setIsLoading(true)
-    setError('')
-    setSuccess('')
-    try {
-      const currentUser = auth.currentUser
-      if (!currentUser) throw new Error('Nem található bejelentkezett felhasználó.')
-
-      const cred = PhoneAuthProvider.credential(verificationId, verificationCode)
-      const assertion = PhoneMultiFactorGenerator.assertion(cred)
-      await multiFactor(currentUser).enroll(assertion, 'Elsődleges telefonszám')
-      
-      setIsEnrolling(false)
-      setVerificationCode('')
-      setPhoneNumber('')
-      setSuccess('2FA sikeresen bekapcsolva!')
-      refreshMfaStatus()
-    } catch (err: any) {
-      console.error(err)
-      setError(err.message || 'Hiba történt a kód ellenőrzése során.')
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  const handleDisableMfa = async () => {
-    if (!window.confirm('Biztosan ki szeretné kapcsolni a kétlépcsős azonosítást?')) return
-    setIsLoading(true)
-    setError('')
-    setSuccess('')
-    try {
-      const currentUser = auth.currentUser
-      if (!currentUser) throw new Error('Nem található bejelentkezett felhasználó.')
-
-      const mfaUser = multiFactor(currentUser)
-      if (mfaUser.enrolledFactors.length > 0) {
-        await mfaUser.unenroll(mfaUser.enrolledFactors[0])
-        setSuccess('2FA sikeresen kikapcsolva.')
-        refreshMfaStatus()
-      }
-    } catch (err: any) {
-      console.error(err)
-      setError(err.message || 'Hiba történt a 2FA kikapcsolásakor.')
-    } finally {
-      setIsLoading(false)
-    }
-  }
 
   return (
     <div className="relative mt-8 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md animate-fade-in text-slate-100">
       <div className="absolute -right-24 -top-24 h-48 w-48 rounded-full bg-indigo-600/5 blur-3xl" />
-      
-      <div id="recaptcha-container-enroll" className="hidden"></div>
 
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/80 pb-6">
         <div>
@@ -1973,119 +2134,26 @@ function MfaSettingsCard() {
             <h3 className="text-lg font-bold tracking-tight text-white">Fiók biztonság (2FA)</h3>
           </div>
           <p className="mt-1 text-sm text-slate-400">
-            Védje fiókját kétlépcsős azonosítással (SMS kódos ellenőrzés).
+            Kötelező Authenticator App (TOTP) védelem minden fiókhoz.
           </p>
         </div>
 
-        <div className="flex items-center gap-3 font-medium">
-          <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-            Állapot:
-          </span>
-          <span
-            className={`text-xs font-bold uppercase rounded-full px-2.5 py-1 ${
-              isMfaEnrolled ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-slate-800 text-slate-500'
-            }`}
-          >
-            {isMfaEnrolled ? 'Aktív' : 'Kikapcsolva'}
-          </span>
-        </div>
+        <span
+          className={`text-xs font-bold uppercase rounded-full px-2.5 py-1 ${
+            isMfaEnrolled
+              ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+              : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+          }`}
+        >
+          {isMfaEnrolled ? 'Aktív' : 'Nincs beállítva'}
+        </span>
       </div>
 
-      <div className="mt-6 space-y-4">
-        {error && (
-          <div className="rounded-lg bg-red-500/15 border border-red-500/20 p-3 text-xs font-medium text-red-400">
-            {error}
-          </div>
-        )}
-        {success && (
-          <div className="rounded-lg bg-emerald-500/15 border border-emerald-500/20 p-3 text-xs font-medium text-emerald-400">
-            {success}
-          </div>
-        )}
-
-        {isMfaEnrolled ? (
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between bg-slate-950/40 p-4 rounded-xl border border-slate-800/80 gap-4">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-indigo-600/10 text-indigo-400">
-                <Phone className="h-5 w-5" />
-              </div>
-              <div>
-                <p className="text-sm font-semibold text-slate-200">Regisztrált telefonszám</p>
-                <p className="text-xs text-slate-500">{enrolledPhone}</p>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={handleDisableMfa}
-              disabled={isLoading}
-              className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-2 text-xs font-semibold text-red-400 hover:bg-red-500/20 transition-all active:scale-95 disabled:opacity-55"
-            >
-              Kikapcsolás
-            </button>
-          </div>
-        ) : isEnrolling ? (
-          <form onSubmit={handleFinishEnroll} className="space-y-4 max-w-md">
-            <div>
-              <label htmlFor="verify-code-input" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                SMS-ben kapott kód
-              </label>
-              <input
-                id="verify-code-input"
-                type="text"
-                required
-                value={verificationCode}
-                onChange={(e) => setVerificationCode(e.target.value)}
-                placeholder="123456"
-                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="submit"
-                disabled={isLoading}
-                className="flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 disabled:opacity-55"
-              >
-                {isLoading ? 'Ellenőrzés…' : 'Kód ellenőrzése és aktiválás'}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setIsEnrolling(false)
-                  setError('')
-                  setSuccess('')
-                }}
-                className="text-xs font-semibold text-slate-400 hover:text-slate-200 px-3 py-2"
-              >
-                Mégse
-              </button>
-            </div>
-          </form>
-        ) : (
-          <form onSubmit={handleStartEnroll} className="space-y-4 max-w-md">
-            <div>
-              <label htmlFor="phone-number-input" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                Telefonszám (Nemzetközi formátum, pl. +36301234567)
-              </label>
-              <input
-                id="phone-number-input"
-                type="tel"
-                required
-                value={phoneNumber}
-                onChange={(e) => setPhoneNumber(e.target.value)}
-                placeholder="+36301234567"
-                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={isLoading}
-              className="flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 disabled:opacity-55"
-            >
-              {isLoading ? 'Folyamatban…' : 'MFA Aktiválása (SMS küldése)'}
-            </button>
-          </form>
-        )}
+      <div className="mt-6 rounded-xl border border-slate-800 bg-slate-950/40 p-4">
+        <p className="text-sm text-slate-300">
+          A kétfaktoros hitelesítés kötelező és nem kapcsolható ki. Az Authenticator alkalmazás
+          (Google/Microsoft Authenticator) 6 jegyű dinamikus kódját használja a rendszer.
+        </p>
       </div>
     </div>
   )
@@ -2094,8 +2162,9 @@ function MfaSettingsCard() {
 // ─── App Root ────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [view, setView] = useState<AppView>('login')
+  const [authReady, setAuthReady] = useState(false)
   const [userEmail, setUserEmail] = useState<string | null>(null)
+  const [mfaEnrolled, setMfaEnrolled] = useState(false)
   const [subscriptionStatus, setSubscriptionStatus] = useState<string>('none')
   const [processedEmailsThisMonth, setProcessedEmailsThisMonth] = useState<number>(0)
   const [tier, setTier] = useState<string>('basic')
@@ -2105,6 +2174,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([])
 
   const hasAccess = subscriptionStatus === 'active'
+  const needsPaywall = subscriptionStatus === 'none' || subscriptionStatus === 'pending'
 
   // AI automation states
   const [activeTab, setActiveTab] = useState<'tasks' | 'automation'>('tasks')
@@ -2235,16 +2305,28 @@ export default function App() {
     promptRulesRef.current = promptRules
   }, [promptRules])
 
+  const refreshMfaState = useCallback(async () => {
+    const user = auth.currentUser
+    if (!user) {
+      setMfaEnrolled(false)
+      return
+    }
+    await user.reload()
+    setMfaEnrolled(multiFactor(user).enrolledFactors.length > 0)
+  }, [])
+
   // Listen for Auth changes
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         setUserEmail(user.email)
-        setView('dashboard')
+        await user.reload()
+        setMfaEnrolled(multiFactor(user).enrolledFactors.length > 0)
       } else {
         setUserEmail(null)
-        setView('login')
+        setMfaEnrolled(false)
       }
+      setAuthReady(true)
     })
     return () => unsubscribe()
   }, [])
@@ -2260,7 +2342,7 @@ export default function App() {
     const unsubscribe = onSnapshot(userRef, (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data()
-        setSubscriptionStatus(data?.subscriptionStatus === 'active' ? 'active' : 'none')
+        setSubscriptionStatus(data?.subscriptionStatus ?? 'none')
         setProcessedEmailsThisMonth(data?.processedEmailsThisMonth ?? 0)
         setTier(data?.tier ?? 'basic')
       } else {
@@ -2282,11 +2364,6 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
 
-  const handleLogin = (email: string) => {
-    setUserEmail(email)
-    setView('dashboard')
-  }
-
   const handleLogout = async () => {
     try {
       await signOut(auth)
@@ -2294,8 +2371,8 @@ export default function App() {
       console.error('Logout error:', err)
     }
     setUserEmail(null)
+    setMfaEnrolled(false)
     setSubscriptionStatus('none')
-    setView('login')
     setCategoryFilter('Összes')
     setCompletingIds(new Set())
     setToasts([])
@@ -2303,15 +2380,26 @@ export default function App() {
     setAutomationEnabled(false)
   }
 
-  const handleSubscribe = async () => {
+  const handleSelectTier = async (selectedTier: SubscriptionTier) => {
     if (!userEmail) return
-    try {
-      const userRef = doc(db, 'users', userEmail)
-      await setDoc(userRef, { subscriptionStatus: 'active' }, { merge: true })
-      setSubscriptionStatus('active')
-    } catch (err) {
-      console.error('Error starting subscription:', err)
-    }
+    const userRef = doc(db, 'users', userEmail)
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(userRef)
+      if (!snap.exists()) {
+        transaction.set(userRef, {
+          email: userEmail,
+          subscriptionStatus: 'active',
+          tier: selectedTier,
+          processedEmailsThisMonth: 0,
+          createdAt: new Date().toISOString(),
+        })
+      } else {
+        transaction.update(userRef, {
+          subscriptionStatus: 'active',
+          tier: selectedTier,
+        })
+      }
+    })
   }
 
   const handleCompleteTask = async (id: string) => {
@@ -2569,17 +2657,33 @@ export default function App() {
 
   return (
     <>
-      {view === 'login' && <LoginView onLogin={handleLogin} />}
+      {!authReady && (
+        <div className="flex min-h-screen items-center justify-center bg-slate-950">
+          <span className="h-8 w-8 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent" />
+        </div>
+      )}
 
-      {view !== 'login' && userEmail && !hasAccess && (
-        <PaywallView
+      {authReady && !userEmail && (
+        <LoginView onAuthenticated={() => refreshMfaState()} />
+      )}
+
+      {authReady && userEmail && !mfaEnrolled && (
+        <MfaSetupView
           userEmail={userEmail}
-          onSubscribe={handleSubscribe}
+          onEnrolled={() => refreshMfaState()}
           onLogout={handleLogout}
         />
       )}
 
-       {view !== 'login' && userEmail && hasAccess && (
+      {authReady && userEmail && mfaEnrolled && needsPaywall && (
+        <PaywallView
+          userEmail={userEmail}
+          onSelectTier={handleSelectTier}
+          onLogout={handleLogout}
+        />
+      )}
+
+      {authReady && userEmail && mfaEnrolled && hasAccess && (
         <MainDashboard
           userEmail={userEmail}
           tasks={tasks}
@@ -2608,7 +2712,7 @@ export default function App() {
         isOpen={isFeedbackOpen}
         onClose={() => setIsFeedbackOpen(false)}
         onSubmit={handleSubmitFeedback}
-        userEmail={userEmail || DEMO_USER_EMAIL}
+        userEmail={userEmail || ''}
       />
 
       {/* Manual Reply Modal */}
