@@ -28,15 +28,24 @@ interface FeedbackSubmitRequest {
 
 /**
  * SUBSYSTEM 1: handleIncomingEmail
- * Replaces Make.com email-to-task pipeline.
+ * Replaces Make.com e-mail to task pipeline.
  * Input: POST JSON payload: { sender, subject, textContent, userId }
  */
 export const handleIncomingEmail = onRequest({
   cors: true,
-  secrets: ["OPENAI_API_KEY"],
+  secrets: ["OPENAI_API_KEY", "SERVER_WEBHOOK_KEY"],
   maxInstances: 10,
+  invoker: "public",
 }, async (req, res) => {
   try {
+    // Validate custom server-to-server webhook key
+    const serverKey = req.headers["x-normaflow-server-key"];
+    if (!serverKey || serverKey !== process.env.SERVER_WEBHOOK_KEY) {
+      logger.warn("Unauthorized request to handleIncomingEmail: invalid server key");
+      res.status(401).send("Unauthorized: Invalid server webhook key");
+      return;
+    }
+
     // Validate Method
     if (req.method !== "POST") {
       logger.warn(`Method Not Allowed: ${req.method}`);
@@ -146,13 +155,48 @@ export const handleIncomingEmail = onRequest({
 /**
  * SUBSYSTEM 2: handleFeedbackSubmit
  * Replaces Make.com webhook for the client-side Feedback Box.
- * Input: POST JSON payload: { title, category, description, user_email }
+ * Input: POST JSON payload: { title, category, description }
+ * Authentication: Enforced ID Token validation via Authorization header
  */
 export const handleFeedbackSubmit = onRequest({
   cors: true,
   maxInstances: 10,
+  invoker: "public",
 }, async (req, res) => {
   try {
+    if (req.method === 'OPTIONS') {
+      res.set('Access-Control-Allow-Origin', '*');
+      res.set('Access-Control-Allow-Methods', 'GET, POST');
+      res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.status(204).send('');
+      return;
+    }
+
+    // Verify JWT ID Token from Authorization header
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      logger.warn("Unauthorized request to handleFeedbackSubmit: missing or invalid authorization header");
+      res.status(401).send("Unauthorized: Missing or invalid Authorization header");
+      return;
+    }
+
+    const idToken = authHeader.split("Bearer ")[1];
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(idToken);
+    } catch (err: any) {
+      logger.error("Token verification failed:", err);
+      res.status(401).send("Unauthorized: Invalid token");
+      return;
+    }
+
+    const verifiedUserEmail = decodedToken.email;
+    if (!verifiedUserEmail) {
+      logger.warn("Unauthorized request to handleFeedbackSubmit: token contains no email");
+      res.status(401).send("Unauthorized: Token contains no email");
+      return;
+    }
+
     // Validate Method
     if (req.method !== "POST") {
       logger.warn(`Method Not Allowed: ${req.method}`);
@@ -160,24 +204,24 @@ export const handleFeedbackSubmit = onRequest({
       return;
     }
 
-    const { title, category, description, user_email } = req.body as Partial<FeedbackSubmitRequest>;
+    const { title, category, description } = req.body as Partial<FeedbackSubmitRequest>;
 
     // Step A: Validation
-    if (!title || !category || !user_email) {
-      logger.warn("Validation failed: missing title, category, or user_email");
+    if (!title || !category) {
+      logger.warn("Validation failed: missing title or category");
       res.status(400).json({
         error: "Bad Request",
-        message: "Missing required fields. 'title', 'category', and 'user_email' are required.",
+        message: "Missing required fields. 'title' and 'category' are required.",
       });
       return;
     }
 
-    // Step B: Firestore Ingestion
+    // Step B: Firestore Ingestion using the cryptographically verified user email
     const feedbackPayload = {
       title,
       type: category, // category string maps to type field
       description: description || "",
-      user_email,
+      user_email: verifiedUserEmail,
       created_at: new Date().toISOString(),
     };
 

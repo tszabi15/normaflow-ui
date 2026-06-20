@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import { X, Lightbulb } from 'lucide-react'
+import { auth } from '../../firebase'
 
 interface FeedbackModalProps {
   isOpen: boolean
@@ -37,16 +38,19 @@ export default function FeedbackModal({
         mappedCategory = 'Design'
       }
 
+      // Programmatically retrieve active ID token from current logged-in accountant session
+      const token = await auth.currentUser?.getIdToken(true)
+
       const response = await fetch('https://handlefeedbacksubmit-cdaanjspxq-uc.a.run.app', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token || ''}`,
         },
         body: JSON.stringify({
           title: title.trim(),
           category: mappedCategory,
           description: description.trim(),
-          user_email: userEmail,
         }),
       })
 
