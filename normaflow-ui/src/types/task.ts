@@ -25,4 +25,8 @@ export interface Task {
   ai_summary?: string
   textContent?: string
   archivedAt?: any
+  source_email?: string
+  source_provider?: string
+  source_mailbox?: string
+  received_via?: 'forwarder' | 'imap'
 }

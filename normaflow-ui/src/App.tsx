@@ -17,6 +17,7 @@ import {
   ShieldAlert,
   Trash2,
   Plus,
+  Copy,
 } from 'lucide-react'
 
 // Import components and types
@@ -682,6 +683,15 @@ function TaskCard({
           <p className="mt-1.5 truncate text-[11px] text-slate-600">
             Tárgy: {task.subject}
           </p>
+
+          {task.source_email && (
+            <div className="mt-2">
+              <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-full">
+                <Mail className="h-2.5 w-2.5 shrink-0" />
+                Fiók: {task.source_email}
+              </span>
+            </div>
+          )}
 
           {/* AI Response States */}
           {task.ai_status === 'generating' && (
@@ -1537,8 +1547,21 @@ function WhitelistSettingsCard({
 
 type EmailProvider = 'google' | 'outlook' | 'custom'
 
+interface EmailConnection {
+  id: string
+  provider: EmailProvider
+  email: string
+  imapHost?: string
+  imapPort?: number
+  smtpHost?: string
+  smtpPort?: number
+  connected_at?: string
+}
+
 function EmailConfigCard({ userEmail }: { userEmail: string }) {
-  const [provider, setProvider] = useState<EmailProvider>('google')
+  const [connections, setConnections] = useState<EmailConnection[]>([])
+  const [isAddOpen, setIsAddOpen] = useState(false)
+  const [provider, setProvider] = useState<EmailProvider>('outlook')
   const [configEmail, setConfigEmail] = useState('')
   const [configPassword, setConfigPassword] = useState('')
   const [imapHost, setImapHost] = useState('')
@@ -1549,31 +1572,24 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
   const [isSyncing, setIsSyncing] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
-  const [isConnected, setIsConnected] = useState(false)
-  const [connectedProvider, setConnectedProvider] = useState<EmailProvider | null>(null)
+  const [copied, setCopied] = useState(false)
 
-  // Load existing config on mount
+  // Load email connections in real-time
   useEffect(() => {
-    const loadConfig = async () => {
-      try {
-        const configRef = doc(db, `users/${userEmail}/tokens/email_config`)
-        const snap = await getDoc(configRef)
-        if (snap.exists()) {
-          const data = snap.data()
-          setProvider(data.provider || 'google')
-          setConfigEmail(data.email || '')
-          setImapHost(data.imapHost || '')
-          setImapPort(String(data.imapPort || 993))
-          setSmtpHost(data.smtpHost || '')
-          setSmtpPort(String(data.smtpPort || 587))
-          setIsConnected(true)
-          setConnectedProvider(data.provider || 'google')
-        }
-      } catch (err) {
-        console.error('Error loading email config:', err)
-      }
-    }
-    loadConfig()
+    const q = collection(db, `users/${userEmail}/email_connections`)
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list: EmailConnection[] = []
+      snapshot.forEach((docSnap) => {
+        list.push({
+          id: docSnap.id,
+          ...docSnap.data()
+        } as EmailConnection)
+      })
+      setConnections(list)
+    }, (err) => {
+      console.error('Error loading email connections:', err)
+    })
+    return () => unsubscribe()
   }, [userEmail])
 
   // Pre-fill servers when provider changes
@@ -1594,7 +1610,7 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
     }
   }
 
-  const handleSaveConfig = async (e: React.FormEvent) => {
+  const handleAddConnection = async (e: React.FormEvent) => {
     e.preventDefault()
     setIsLoading(true)
     setError('')
@@ -1612,15 +1628,37 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
         payload.smtpHost = smtpHost.trim()
         payload.smtpPort = parseInt(smtpPort) || 587
       }
-      const configRef = doc(db, `users/${userEmail}/tokens/email_config`)
-      await setDoc(configRef, payload, { merge: true })
-      setIsConnected(true)
-      setConnectedProvider(provider)
+
+      const colRef = collection(db, `users/${userEmail}/email_connections`)
+      await addDoc(colRef, payload)
       setSuccess('E-mail fiók sikeresen összekapcsolva!')
+      setIsAddOpen(false)
+      // Reset form
+      setConfigEmail('')
+      setConfigPassword('')
+      setImapHost('')
+      setImapPort('993')
+      setSmtpHost('')
+      setSmtpPort('587')
     } catch (err: any) {
-      setError(err.message || 'Hiba történt a konfiguráció mentése során.')
+      setError(err.message || 'Hiba történt a kapcsolódás során.')
     } finally {
       setIsLoading(false)
+    }
+  }
+
+  const handleDeleteConnection = async (id: string) => {
+    if (!window.confirm('Biztosan törölni szeretné ezt a fiókot és megszakítani a szinkronizációt?')) {
+      return
+    }
+    setError('')
+    setSuccess('')
+    try {
+      const docRef = doc(db, `users/${userEmail}/email_connections`, id)
+      await deleteDoc(docRef)
+      setSuccess('E-mail fiók kapcsolat sikeresen eltávolítva!')
+    } catch (err: any) {
+      setError(err.message || 'Hiba történt a törlés során.')
     }
   }
 
@@ -1648,198 +1686,324 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
     }
   }
 
+  const forwarderAddress = `${userEmail.replace('@', '-')}-inbound@task.normaflow.hu`
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(forwarderAddress)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
   const PROVIDERS: { key: EmailProvider; label: string; desc: string }[] = [
     { key: 'google', label: 'Google', desc: 'Gmail webhook' },
     { key: 'outlook', label: 'Outlook', desc: 'Office 365 IMAP' },
-    { key: 'custom', label: 'Egyéni', desc: 'IMAP / SMTP' },
+    { key: 'custom', label: 'Egyéni IMAP', desc: 'Saját levelező' },
   ]
 
   return (
-    <div className="relative mt-8 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md animate-fade-in text-slate-100">
-      <div className="absolute -left-24 -top-24 h-48 w-48 rounded-full bg-violet-600/5 blur-3xl" />
-
-      {/* Header */}
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/80 pb-6">
-        <div>
-          <div className="flex items-center gap-2">
-            <Mail className="h-5 w-5 text-indigo-400" />
-            <h3 className="text-lg font-bold tracking-tight text-white">Email Fiók Összekötése</h3>
+    <div className="relative mt-8 space-y-8 animate-fade-in text-slate-100">
+      
+      {/* SECTION 1: Központi NormaFlow Gyűjtőcím */}
+      <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md">
+        <div className="absolute -right-24 -top-24 h-48 w-48 rounded-full bg-indigo-600/5 blur-3xl" />
+        
+        <div className="flex items-center gap-3 border-b border-slate-800/80 pb-4">
+          <div className="p-2.5 rounded-xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+            <Inbox className="h-5 w-5" />
           </div>
-          <p className="mt-1 text-sm text-slate-400">
-            Válasszon szolgáltatót a beérkező levelek automatikus feldolgozásához.
+          <div>
+            <h3 className="text-lg font-bold text-white">Központi NormaFlow Gyűjtőcím (Továbbítás)</h3>
+            <p className="text-xs text-slate-400">Automatizálja a feladatokat e-mailek átirányításával</p>
+          </div>
+        </div>
+
+        <div className="mt-6 space-y-4">
+          <p className="text-sm text-slate-300">
+            Irányítsa át ügyfelei leveleit az alábbi egyedi gyűjtőcímre, és a NormaFlow AI motorja másodperceken belül feldolgozza, rendszerezi és a feladatlistájára helyezi őket.
           </p>
-        </div>
 
-        {isConnected && connectedProvider && (
-          <span className="text-xs font-bold uppercase rounded-full px-2.5 py-1 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-            {connectedProvider === 'google' ? 'Google' : connectedProvider === 'outlook' ? 'Outlook' : 'Egyéni'} aktív
-          </span>
-        )}
-      </div>
-
-      <div className="mt-6 space-y-5">
-        {error && (
-          <div className="rounded-lg bg-red-500/15 border border-red-500/20 p-3 text-xs font-medium text-red-400">{error}</div>
-        )}
-        {success && (
-          <div className="rounded-lg bg-emerald-500/15 border border-emerald-500/20 p-3 text-xs font-medium text-emerald-400">{success}</div>
-        )}
-
-        {/* Provider Selector */}
-        <div className="flex gap-2">
-          {PROVIDERS.map((p) => (
-            <button
-              key={p.key}
-              type="button"
-              onClick={() => handleProviderChange(p.key)}
-              className={`flex-1 rounded-xl border p-3 text-center transition-all ${
-                provider === p.key
-                  ? 'border-indigo-500/50 bg-indigo-500/10 text-white'
-                  : 'border-slate-800 bg-slate-950/40 text-slate-400 hover:border-slate-700 hover:text-slate-300'
-              }`}
-            >
-              <div className="text-sm font-semibold">{p.label}</div>
-              <div className="text-[10px] mt-0.5 opacity-70">{p.desc}</div>
-            </button>
-          ))}
-        </div>
-
-        {/* Google Info */}
-        {provider === 'google' && (
-          <div className="rounded-xl border border-slate-800 bg-slate-950/40 p-4">
-            <p className="text-sm text-slate-300">
-              A Google integráció a meglévő webhook pipeline-on keresztül működik.
-              Konfigurálás nem szükséges — a rendszer automatikusan fogadja a továbbított e-maileket.
-            </p>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              type="text"
+              readOnly
+              value={forwarderAddress}
+              className="flex-1 rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm font-mono text-indigo-300 shadow-inner focus:outline-none"
+            />
             <button
               type="button"
-              onClick={handleSaveConfig}
-              disabled={isLoading}
-              className="mt-4 flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 disabled:opacity-55"
+              onClick={handleCopy}
+              className="flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 whitespace-nowrap"
             >
-              {isLoading ? 'Mentés…' : 'Google konfiguráció mentése'}
-            </button>
-          </div>
-        )}
-
-        {/* Outlook / Custom Form */}
-        {provider !== 'google' && (
-          <form onSubmit={handleSaveConfig} className="space-y-4">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="cfg-email" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">E-mail cím</label>
-                <input
-                  id="cfg-email"
-                  type="email"
-                  required
-                  value={configEmail}
-                  onChange={(e) => setConfigEmail(e.target.value)}
-                  placeholder="user@company.hu"
-                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-              <div>
-                <label htmlFor="cfg-pass" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">Alkalmazás jelszó</label>
-                <input
-                  id="cfg-pass"
-                  type="password"
-                  required
-                  value={configPassword}
-                  onChange={(e) => setConfigPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="cfg-imap-host" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">IMAP szerver</label>
-                <input
-                  id="cfg-imap-host"
-                  type="text"
-                  required
-                  value={imapHost}
-                  onChange={(e) => setImapHost(e.target.value)}
-                  placeholder="imap.company.hu"
-                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-              <div>
-                <label htmlFor="cfg-imap-port" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">IMAP port</label>
-                <input
-                  id="cfg-imap-port"
-                  type="number"
-                  required
-                  value={imapPort}
-                  onChange={(e) => setImapPort(e.target.value)}
-                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="cfg-smtp-host" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">SMTP szerver</label>
-                <input
-                  id="cfg-smtp-host"
-                  type="text"
-                  required
-                  value={smtpHost}
-                  onChange={(e) => setSmtpHost(e.target.value)}
-                  placeholder="smtp.company.hu"
-                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-              <div>
-                <label htmlFor="cfg-smtp-port" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">SMTP port</label>
-                <input
-                  id="cfg-smtp-port"
-                  type="number"
-                  required
-                  value={smtpPort}
-                  onChange={(e) => setSmtpPort(e.target.value)}
-                  className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              disabled={isLoading}
-              className="flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 disabled:opacity-55"
-            >
-              {isLoading ? 'Mentés…' : 'Konfiguráció mentése'}
-            </button>
-          </form>
-        )}
-
-        {/* Manual Sync Button */}
-        {isConnected && connectedProvider && connectedProvider !== 'google' && (
-          <div className="border-t border-slate-800/80 pt-5">
-            <button
-              type="button"
-              onClick={handleManualSync}
-              disabled={isSyncing}
-              className="flex items-center gap-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-5 py-2.5 text-xs font-semibold text-indigo-400 hover:bg-indigo-500/20 transition-all active:scale-95 disabled:opacity-55"
-            >
-              {isSyncing ? (
+              {copied ? (
                 <>
-                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-indigo-400/30 border-t-indigo-400" />
-                  Szinkronizálás…
+                  <Check className="h-4 w-4" />
+                  Másolva!
                 </>
               ) : (
                 <>
-                  <Mail className="h-3.5 w-3.5" />
-                  Levelek szinkronizálása
+                  <Copy className="h-4 w-4" />
+                  Másolás
                 </>
               )}
             </button>
-            <p className="mt-1.5 text-[10px] text-slate-600">
-              Az automatikus szinkronizáció 5 percenként fut a háttérben.
+          </div>
+
+          <div className="rounded-xl border border-slate-800/80 bg-slate-950/30 p-4 space-y-3">
+            <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider">Beállítási útmutató:</h4>
+            <ul className="text-xs text-slate-400 space-y-2.5 list-disc list-inside">
+              <li>
+                <strong className="text-slate-300">Gmail továbbítás:</strong> Menjen a <code className="text-indigo-400 bg-slate-950/60 px-1 py-0.5 rounded">Beállítások &gt; Továbbítás és POP/IMAP</code> menüpontba, kattintson a továbbítási cím hozzáadására, és illessze be a fenti címet.
+              </li>
+              <li>
+                <strong className="text-slate-300">Outlook továbbítás:</strong> A <code className="text-indigo-400 bg-slate-950/60 px-1 py-0.5 rounded">Beállítások &gt; Levelezés &gt; Szabályok</code> részben hozzon létre egy szabályt, amely a beérkező leveleket továbbítja a fenti címre.
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION 2: Multi-IMAP Account Connections Card */}
+      <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md">
+        <div className="absolute -left-24 -top-24 h-48 w-48 rounded-full bg-violet-600/5 blur-3xl" />
+        
+        {/* Header */}
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/80 pb-6">
+          <div>
+            <div className="flex items-center gap-2">
+              <Mail className="h-5 w-5 text-violet-400" />
+              <h3 className="text-lg font-bold tracking-tight text-white">Csatlakoztatott Levelezőfiókok</h3>
+            </div>
+            <p className="mt-1 text-sm text-slate-400">
+              Kapcsoljon össze több külső fiókot az e-mailek folyamatos IMAP szinkronizációjához.
             </p>
           </div>
-        )}
+          <button
+            type="button"
+            onClick={() => setIsAddOpen(!isAddOpen)}
+            className="flex items-center justify-center gap-2 rounded-xl bg-violet-600 px-4 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-violet-500 active:scale-95"
+          >
+            {isAddOpen ? (
+              <>
+                <X className="h-4 w-4" />
+                Mégse
+              </>
+            ) : (
+              <>
+                <Plus className="h-4 w-4" />
+                Új fiók hozzáadása
+              </>
+            )}
+          </button>
+        </div>
+
+        <div className="mt-6 space-y-6">
+          {error && (
+            <div className="rounded-lg bg-red-500/15 border border-red-500/20 p-3 text-xs font-medium text-red-400">{error}</div>
+          )}
+          {success && (
+            <div className="rounded-lg bg-emerald-500/15 border border-emerald-500/20 p-3 text-xs font-medium text-emerald-400">{success}</div>
+          )}
+
+          {/* Add Connection Sliding Panel */}
+          {isAddOpen && (
+            <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-5 space-y-4 animate-slide-down">
+              <h4 className="text-sm font-bold text-white">Új Levelezőfiók Csatlakoztatása</h4>
+              
+              {/* Provider Selector */}
+              <div className="flex gap-2">
+                {PROVIDERS.map((p) => (
+                  <button
+                    key={p.key}
+                    type="button"
+                    onClick={() => handleProviderChange(p.key)}
+                    className={`flex-1 rounded-xl border p-3 text-center transition-all ${
+                      provider === p.key
+                        ? 'border-violet-500/50 bg-violet-500/10 text-white'
+                        : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700 hover:text-slate-300'
+                    }`}
+                  >
+                    <div className="text-sm font-semibold">{p.label}</div>
+                    <div className="text-[10px] mt-0.5 opacity-70">{p.desc}</div>
+                  </button>
+                ))}
+              </div>
+
+              {/* Form */}
+              <form onSubmit={handleAddConnection} className="space-y-4">
+                {provider === 'google' ? (
+                  <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-4">
+                    <p className="text-xs text-slate-400">
+                      A Google integráció a meglévő webhook pipeline-on keresztül automatikusan működik. Mentés után a rendszer fogadja a továbbított e-maileket.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">E-mail cím</label>
+                        <input
+                          type="email"
+                          required
+                          value={configEmail}
+                          onChange={(e) => setConfigEmail(e.target.value)}
+                          placeholder="user@outlook.com"
+                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Alkalmazás jelszó</label>
+                        <input
+                          type="password"
+                          required
+                          value={configPassword}
+                          onChange={(e) => setConfigPassword(e.target.value)}
+                          placeholder="••••••••"
+                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">IMAP szerver</label>
+                        <input
+                          type="text"
+                          required
+                          value={imapHost}
+                          onChange={(e) => setImapHost(e.target.value)}
+                          placeholder="imap-mail.outlook.com"
+                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">IMAP port</label>
+                        <input
+                          type="number"
+                          required
+                          value={imapPort}
+                          onChange={(e) => setImapPort(e.target.value)}
+                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP szerver</label>
+                        <input
+                          type="text"
+                          required
+                          value={smtpHost}
+                          onChange={(e) => setSmtpHost(e.target.value)}
+                          placeholder="smtp-mail.outlook.com"
+                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP port</label>
+                        <input
+                          type="number"
+                          required
+                          value={smtpPort}
+                          onChange={(e) => setSmtpPort(e.target.value)}
+                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={isLoading}
+                  className="flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-violet-500 active:scale-95 disabled:opacity-55"
+                >
+                  {isLoading ? 'Kapcsolódás…' : 'Fiók hozzáadása'}
+                </button>
+              </form>
+            </div>
+          )}
+
+          {/* Account connections list */}
+          <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/30">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-slate-800 text-slate-400 text-xs font-semibold uppercase bg-slate-900/30">
+                  <th className="p-4">Szolgáltató</th>
+                  <th className="p-4">E-mail cím</th>
+                  <th className="p-4">Szinkronizálva</th>
+                  <th className="p-4 text-right">Művelet</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60 text-sm">
+                {connections.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} className="p-8 text-center text-slate-500 text-xs font-medium">
+                      Nincs még csatlakoztatott levelezőfiók.
+                    </td>
+                  </tr>
+                ) : (
+                  connections.map((conn) => (
+                    <tr key={conn.id} className="hover:bg-slate-900/30 transition-colors">
+                      <td className="p-4">
+                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold capitalize border ${
+                          conn.provider === 'google'
+                            ? 'bg-red-500/10 text-red-400 border-red-500/20'
+                            : conn.provider === 'outlook'
+                            ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                            : 'bg-violet-500/10 text-violet-400 border-violet-500/20'
+                        }`}>
+                          {conn.provider}
+                        </span>
+                      </td>
+                      <td className="p-4 font-medium text-slate-200">{conn.email}</td>
+                      <td className="p-4 text-xs text-slate-500 font-mono">
+                        {conn.connected_at ? new Date(conn.connected_at).toLocaleString('hu-HU') : 'Ismeretlen'}
+                      </td>
+                      <td className="p-4 text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteConnection(conn.id)}
+                          className="p-2 rounded-lg bg-red-500/10 text-red-400 border border-red-500/10 hover:bg-red-500/20 hover:text-red-300 transition-all"
+                          title="Fiók törlése"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Manual sync and details */}
+          {connections.some(c => c.provider !== 'google') && (
+            <div className="border-t border-slate-800/80 pt-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+              <button
+                type="button"
+                onClick={handleManualSync}
+                disabled={isSyncing}
+                className="flex items-center justify-center gap-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-5 py-2.5 text-xs font-semibold text-indigo-400 hover:bg-indigo-500/20 transition-all active:scale-95 disabled:opacity-55 w-full sm:w-auto"
+              >
+                {isSyncing ? (
+                  <>
+                    <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-indigo-400/30 border-t-indigo-400" />
+                    Szinkronizálás…
+                  </>
+                ) : (
+                  <>
+                    <Mail className="h-3.5 w-3.5" />
+                    Levelek szinkronizálása most
+                  </>
+                )}
+              </button>
+              <p className="text-[10px] text-slate-500">
+                Az automatikus háttérszinkronizáció 5 percenként fut a csatlakoztatott fiókokon.
+              </p>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -1879,12 +2043,14 @@ export default function App() {
   const [replyBody, setReplyBody] = useState('')
   const [isImprovingDraft, setIsImprovingDraft] = useState(false)
   const [isSendingReply, setIsSendingReply] = useState(false)
+  const [replyError, setReplyError] = useState<{ code: string; message: string } | null>(null)
 
   const handleWriteReply = (task: Task) => {
     setReplyTask(task)
     setReplyRecipient(task.sender)
     setReplySubject(task.subject.startsWith('Re:') ? task.subject : `Re: ${task.subject}`)
     setReplyBody(task.ai_reply || '')
+    setReplyError(null)
   }
 
   const handleImproveDraft = async () => {
@@ -1957,6 +2123,10 @@ export default function App() {
 
       if (!response.ok) {
         const errorData = await response.json()
+        if (errorData.error === 'SMTP_NOT_CONFIGURED') {
+          setReplyError({ code: 'SMTP_NOT_CONFIGURED', message: errorData.message || '' })
+          throw new Error('SMTP_NOT_CONFIGURED')
+        }
         throw new Error(errorData.message || 'Sikertelen e-mail küldés.')
       }
 
@@ -1973,7 +2143,9 @@ export default function App() {
       ])
     } catch (err: any) {
       console.error(err)
-      alert('Hiba az e-mail küldése során: ' + err.message)
+      if (err.message !== 'SMTP_NOT_CONFIGURED') {
+        alert('Hiba az e-mail küldése során: ' + err.message)
+      }
     } finally {
       setIsSendingReply(false)
     }
@@ -2391,22 +2563,52 @@ export default function App() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
           <div className="w-full max-w-2xl overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/90 shadow-2xl backdrop-blur-md transition-all duration-300">
             {/* Modal Header */}
-            <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
-              <div className="flex items-center gap-2">
-                <Mail className="h-5 w-5 text-indigo-400" />
-                <h3 className="text-base font-bold text-white">Manuális válasz küldése</h3>
+            <div className="flex flex-col border-b border-slate-800 px-6 py-4 gap-1 bg-slate-900/40">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Mail className="h-5 w-5 text-indigo-400" />
+                  <h3 className="text-base font-bold text-white">Manuális válasz küldése</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setReplyTask(null)}
+                  className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors"
+                >
+                  <X className="h-5 w-5" />
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => setReplyTask(null)}
-                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors"
-              >
-                <X className="h-5 w-5" />
-              </button>
+              <div className="flex items-center mt-1">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 px-2.5 py-0.5 text-xs font-medium text-indigo-300">
+                  Küldő fiók: <span className="font-mono text-white">{replyTask.source_mailbox || replyTask.source_email || userEmail || ''}</span>
+                </span>
+              </div>
             </div>
 
             {/* Modal Body */}
             <div className="space-y-4 p-6">
+              {replyError?.code === 'SMTP_NOT_CONFIGURED' && (
+                <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-xs text-red-400 animate-fade-in">
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                    <div className="space-y-2">
+                      <p className="font-medium leading-normal">
+                        Nem tudunk levelet küldeni a(z) <strong className="text-white font-mono">{replyTask.source_mailbox || replyTask.source_email || ''}</strong> címről, mert még nem kapcsolta össze az SMTP kimenő szervert az AI Automatizáció menüpontban.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setReplyTask(null)
+                          setActiveTab('automation')
+                        }}
+                        className="inline-flex items-center gap-1 font-bold underline hover:text-red-300 transition-colors"
+                      >
+                        <span>Ugrás az SMTP Beállításokhoz &rarr;</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">Címzett</label>
                 <input

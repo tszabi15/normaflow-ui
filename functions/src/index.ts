@@ -25,6 +25,7 @@ interface IncomingEmailRequest {
   textContent: string;
   userEmail?: string;
   userId?: string;
+  to?: string;
 }
 
 interface FeedbackSubmitRequest {
@@ -104,6 +105,30 @@ function resolveEmailServers(config: EmailConfig): { imapHost: string; imapPort:
   };
 }
 
+async function resolveSmtpConfig(userEmail: string, preferredEmail?: string): Promise<EmailConfig | null> {
+  if (preferredEmail) {
+    const connSnap = await db.collection("users").doc(userEmail).collection("email_connections")
+      .where("email", "==", preferredEmail)
+      .limit(1)
+      .get();
+    if (!connSnap.empty) {
+      return connSnap.docs[0].data() as EmailConfig;
+    }
+  }
+
+  const connsSnap = await db.collection("users").doc(userEmail).collection("email_connections").limit(1).get();
+  if (!connsSnap.empty) {
+    return connsSnap.docs[0].data() as EmailConfig;
+  }
+
+  const legacyDoc = await db.doc(`users/${userEmail}/tokens/email_config`).get();
+  if (legacyDoc.exists) {
+    return legacyDoc.data() as EmailConfig;
+  }
+
+  return null;
+}
+
 /**
  * SUBSYSTEM 1: handleIncomingEmail
  * Replaces Make.com e-mail to task pipeline.
@@ -126,7 +151,7 @@ const handleIncomingEmailLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
-    const { sender, subject, textContent, userEmail, userId } = req.body as Partial<IncomingEmailRequest>;
+    const { sender, subject, textContent, userEmail, userId, to } = req.body as Partial<IncomingEmailRequest>;
     const targetEmail = userEmail || userId;
 
     // Step A: Validation & Strict Spam Filter
@@ -134,6 +159,17 @@ const handleIncomingEmailLogic: express.RequestHandler = async (req, res) => {
       logger.warn("Validation failed: missing sender, textContent, or targetEmail");
       res.status(400).json({ error: "Bad Request" });
       return;
+    }
+
+    let sourceMailbox = to ? extractEmail(to) : "";
+    if (!sourceMailbox && textContent) {
+      const toMatch = textContent.match(/To:\s*([^\r\n]+)/i);
+      if (toMatch && toMatch[1]) {
+        sourceMailbox = extractEmail(toMatch[1]);
+      }
+    }
+    if (!sourceMailbox) {
+      sourceMailbox = extractEmail(targetEmail);
     }
 
     const senderLower = sender.toLowerCase();
@@ -276,6 +312,8 @@ A választ szigorúan JSON formátumban add vissza, az alábbi kulcsokkal:
       ai_reply: aiReply,
       ai_summary: aiSummary,
       textContent: textContent,
+      received_via: "forwarder",
+      source_mailbox: sourceMailbox,
     };
 
     logger.info("Saving new task to Firestore...");
@@ -327,6 +365,15 @@ const handleFeedbackSubmitLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    const { title, category, description } = req.body as Partial<FeedbackSubmitRequest>;
+
+    // Step A: Validation
+    if (!title || typeof title !== "string" || title.trim() === "" || !category || typeof category !== "string" || category.trim() === "") {
+      logger.warn("Validation failed: missing or empty title or category");
+      res.status(400).json({ error: "Bad Request" });
+      return;
+    }
+
     // Verify JWT ID Token from Authorization header
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -363,15 +410,6 @@ const handleFeedbackSubmitLogic: express.RequestHandler = async (req, res) => {
     if (!userDoc.exists || userDoc.data()?.subscriptionStatus !== 'active') {
       logger.warn(`Forbidden request to handleFeedbackSubmit: user ${verifiedUserEmail} does not have an active subscription`);
       res.status(403).json({ error: "Forbidden: Active subscription required to submit feedback" });
-      return;
-    }
-
-    const { title, category, description } = req.body as Partial<FeedbackSubmitRequest>;
-
-    // Step A: Validation
-    if (!title || typeof title !== "string" || title.trim() === "" || !category || typeof category !== "string" || category.trim() === "") {
-      logger.warn("Validation failed: missing or empty title or category");
-      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -436,16 +474,6 @@ async function performEmailSync(targetEmail: string): Promise<number> {
     return 0;
   }
 
-  // Load email config
-  const configDoc = await db.doc(`users/${targetEmail}/tokens/email_config`).get();
-  if (!configDoc.exists) return 0;
-  const config = configDoc.data() as EmailConfig;
-
-  // Google users rely on the webhook pipeline, skip IMAP sync
-  if (config.provider === "google" || !config.password) return 0;
-
-  const servers = resolveEmailServers(config);
-
   // Load auto-responder rules
   const rulesDoc = await db.doc(`users/${targetEmail}/settings/auto_responder`).get();
   let automationEnabled = false;
@@ -460,98 +488,119 @@ async function performEmailSync(targetEmail: string): Promise<number> {
     }
   }
 
+  // Fetch all documents inside users/{targetEmail}/email_connections
+  const connectionsSnap = await db.collection("users").doc(targetEmail).collection("email_connections").get();
+  if (connectionsSnap.empty) {
+    logger.info(`performEmailSync: No email connections found for ${targetEmail}`);
+    return 0;
+  }
 
-  // Connect to IMAP
-  const client = new ImapFlow({
-    host: servers.imapHost,
-    port: servers.imapPort,
-    secure: true,
-    auth: {
-      user: config.email,
-      pass: config.password,
-    },
-    logger: false,
-  });
+  for (const connDoc of connectionsSnap.docs) {
+    const config = connDoc.data() as EmailConfig;
 
-  try {
-    await client.connect();
-    const lock = await client.getMailboxLock("INBOX");
+    // Google users rely on the webhook pipeline, skip IMAP sync for them
+    if (config.provider === "google" || !config.password || !config.email) {
+      continue;
+    }
+
+    if (processedEmailsThisMonth >= limit) {
+      logger.warn(`performEmailSync: User ${targetEmail} reached limit of ${limit}. Skipping remaining connections.`);
+      break;
+    }
+
+    const servers = resolveEmailServers(config);
+
+    // Connect to IMAP
+    const client = new ImapFlow({
+      host: servers.imapHost,
+      port: servers.imapPort,
+      secure: true,
+      auth: {
+        user: config.email,
+        pass: config.password,
+      },
+      logger: false,
+    });
 
     try {
-      // Fetch unseen messages
-      const messages = client.fetch({ seen: false }, { source: true, envelope: true });
+      await client.connect();
+      const lock = await client.getMailboxLock("INBOX");
 
-      for await (const msg of messages) {
-        const envelope = msg.envelope;
-        if (!envelope) continue;
-        const sender = envelope.from?.[0]?.address || "";
-        const subject = envelope.subject || "";
-        const rawSource = msg.source?.toString("utf-8") || "";
+      try {
+        // Fetch unseen messages
+        const messages = client.fetch({ seen: false }, { source: true, envelope: true });
 
-        // Quota check inside loop
-        if (processedEmailsThisMonth >= limit) {
-          logger.warn(`performEmailSync: User ${targetEmail} reached limit of ${limit}. Aborting sync loop.`);
-          break;
-        }
+        for await (const msg of messages) {
+          const envelope = msg.envelope;
+          if (!envelope) continue;
+          const sender = envelope.from?.[0]?.address || "";
+          const subject = envelope.subject || "";
+          const rawSource = msg.source?.toString("utf-8") || "";
 
-        // Whitelist check
-        let isWhitelisted = true;
-        if (enforceWhitelist) {
-          const senderEmail = extractEmail(sender);
-          const clientsSnap = await db.collection("users")
-            .doc(targetEmail)
-            .collection("clients")
-            .where("email", "==", senderEmail)
-            .get();
-
-          if (clientsSnap.empty) {
-            isWhitelisted = false;
+          // Quota check inside loop
+          if (processedEmailsThisMonth >= limit) {
+            logger.warn(`performEmailSync: User ${targetEmail} reached limit of ${limit}. Aborting sync for this connection.`);
+            break;
           }
-        }
 
-        if (!isWhitelisted) {
-          const senderEmail = extractEmail(sender);
-          logger.info(`performEmailSync: Whitelist check failed for sender ${senderEmail}. Skipping.`);
-          if (msg.uid) {
-            await client.messageFlagsAdd({ uid: msg.uid }, ["\\Seen"], { uid: true });
-          }
-          continue;
-        }
+          // Whitelist check
+          let isWhitelisted = true;
+          if (enforceWhitelist) {
+            const senderEmail = extractEmail(sender);
+            const clientsSnap = await db.collection("users")
+              .doc(targetEmail)
+              .collection("clients")
+              .where("email", "==", senderEmail)
+              .get();
 
-        // Extract plain text body (simple extraction from raw source)
-        let textContent = "";
-        const boundaryMatch = rawSource.match(/boundary="?([^"\r\n]+)"?/);
-        if (boundaryMatch) {
-          // Multipart: find text/plain part
-          const parts = rawSource.split(boundaryMatch[1]);
-          for (const part of parts) {
-            if (part.includes("text/plain")) {
-              const bodyStart = part.indexOf("\r\n\r\n");
-              if (bodyStart !== -1) {
-                textContent = part.substring(bodyStart + 4).trim();
-                break;
-              }
+            if (clientsSnap.empty) {
+              isWhitelisted = false;
             }
           }
-        } else {
-          // Simple message: body after double newline
-          const bodyStart = rawSource.indexOf("\r\n\r\n");
-          textContent = bodyStart !== -1 ? rawSource.substring(bodyStart + 4).trim() : rawSource;
-        }
 
-        // Spam filter
-        if (!sender || isSpamSender(sender) || textContent.length < 20) {
-          logger.info(`syncEmails: Filtered email from ${sender} for user ${targetEmail}`);
-          continue;
-        }
+          if (!isWhitelisted) {
+            const senderEmail = extractEmail(sender);
+            logger.info(`performEmailSync: Whitelist check failed for sender ${senderEmail}. Skipping.`);
+            if (msg.uid) {
+              await client.messageFlagsAdd({ uid: msg.uid }, ["\\Seen"], { uid: true });
+            }
+            continue;
+          }
 
-        // AI Engine
-        let aiReply: string | null = null;
-        let aiSummary = "Nem sikerült összefoglalót készíteni.";
-        if (process.env.OPENAI_API_KEY) {
-          try {
-            const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-            const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy elemezd a beérkező e-mailt.
+          // Extract plain text body (simple extraction from raw source)
+          let textContent = "";
+          const boundaryMatch = rawSource.match(/boundary="?([^"\r\n]+)"?/);
+          if (boundaryMatch) {
+            // Multipart: find text/plain part
+            const parts = rawSource.split(boundaryMatch[1]);
+            for (const part of parts) {
+              if (part.includes("text/plain")) {
+                const bodyStart = part.indexOf("\r\n\r\n");
+                if (bodyStart !== -1) {
+                  textContent = part.substring(bodyStart + 4).trim();
+                  break;
+                }
+              }
+            }
+          } else {
+            // Simple message: body after double newline
+            const bodyStart = rawSource.indexOf("\r\n\r\n");
+            textContent = bodyStart !== -1 ? rawSource.substring(bodyStart + 4).trim() : rawSource;
+          }
+
+          // Spam filter
+          if (!sender || isSpamSender(sender) || textContent.length < 20) {
+            logger.info(`syncEmails: Filtered e-mail from ${sender} for user ${targetEmail}`);
+            continue;
+          }
+
+          // AI Engine
+          let aiReply: string | null = null;
+          let aiSummary = "Nem sikerült összefoglalót készíteni.";
+          if (process.env.OPENAI_API_KEY) {
+            try {
+              const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+              const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy elemezd a beérkező e-mailt.
 Készíts egy rövid, 1-2 mondatos magyar nyelvű összefoglalót és szükség esetén teendőket (actionable bullet points) a könyvelő számára.
 
 ${automationEnabled && promptRules.trim() ? `Ezen kívül a könyvelő által meghatározott egyedi szabályok alapján készíts egy hivatalos, udvarias választervezet-javaslatot is.
@@ -562,68 +611,70 @@ A választ szigorúan JSON formátumban add vissza, az alábbi kulcsokkal:
 - "summary": A beérkező e-mail 1-2 mondatos magyar nyelvű összefoglalója, alatta új sorban a teendők listájával (pl. "Összegzés: ... \\nTeendők:\\n- ...").
 - "reply": A szabályok alapján generált választervezet szövege, vagy null, ha az automatikus választervezés nincs engedélyezve/nem alkalmazható.`;
 
-            const userPrompt = `Feladó: ${sender}\nTárgy: ${subject || "Nincs tárgy megadva"}\nÜzenet:\n${textContent.substring(0, 2000)}`;
+              const userPrompt = `Feladó: ${sender}\nTárgy: ${subject || "Nincs tárgy megadva"}\nÜzenet:\n${textContent.substring(0, 2000)}`;
 
-            const response = await openai.chat.completions.create({
-              model: "gpt-4o-mini",
-              messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userPrompt },
-              ],
-              response_format: { type: "json_object" },
-              max_tokens: 600,
-            });
-            const result = JSON.parse(response.choices[0]?.message?.content || "{}");
-            aiSummary = result.summary || "Nem sikerült összefoglalót készíteni.";
-            aiReply = result.reply || null;
-          } catch (aiErr) {
-            logger.error(`syncEmails: AI error for ${targetEmail}:`, aiErr);
+              const response = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [
+                  { role: "system", content: systemPrompt },
+                  { role: "user", content: userPrompt },
+                ],
+                response_format: { type: "json_object" },
+                max_tokens: 600,
+              });
+              const result = JSON.parse(response.choices[0]?.message?.content || "{}");
+              aiSummary = result.summary || "Nem sikerült összefoglalót készíteni.";
+              aiReply = result.reply || null;
+            } catch (aiErr) {
+              logger.error(`syncEmails: AI error for ${targetEmail}:`, aiErr);
+            }
+          }
+
+          // Push task to Firestore
+          const aiStatus = "pending_review";
+          const nextStep = aiReply ? "AI választervezet felülvizsgálata" : "Manuális válasz írása szükséges";
+
+          await db.collection("tasks").add({
+            category: "E-mail",
+            summary: subject || "Nincs tárgy megadva",
+            next_step: nextStep,
+            priority: 3,
+            received_at: new Date().toISOString(),
+            sender,
+            subject: subject || "",
+            user_email: targetEmail,
+            status: "active",
+            archivedAt: null,
+            ai_status: aiStatus,
+            ai_reply: aiReply,
+            ai_summary: aiSummary,
+            textContent: textContent,
+            source_provider: config.provider,
+            source_email: config.email,
+            received_via: "imap",
+            source_mailbox: config.email,
+          });
+
+          // Increment processed email count
+          await db.collection("users").doc(targetEmail).update({
+            processedEmailsThisMonth: admin.firestore.FieldValue.increment(1)
+          });
+          processedEmailsThisMonth++;
+          synced++;
+
+          // Mark as seen
+          if (msg.uid) {
+            await client.messageFlagsAdd({ uid: msg.uid }, ["\\Seen"], { uid: true });
           }
         }
-
-        // Push task to Firestore
-        const aiStatus = "pending_review";
-        const nextStep = aiReply ? "AI választervezet felülvizsgálata" : "Manuális válasz írása szükséges";
-
-        await db.collection("tasks").add({
-          category: "E-mail",
-          summary: subject || "Nincs tárgy megadva",
-          next_step: nextStep,
-          priority: 3,
-          received_at: new Date().toISOString(),
-          sender,
-          subject: subject || "",
-          user_email: targetEmail,
-          status: "active",
-          archivedAt: null,
-          ai_status: aiStatus,
-          ai_reply: aiReply,
-          ai_summary: aiSummary,
-          textContent: textContent,
-          source_provider: config.provider,
-        });
-
-        // Increment processed email count
-        await db.collection("users").doc(targetEmail).update({
-          processedEmailsThisMonth: admin.firestore.FieldValue.increment(1)
-        });
-        processedEmailsThisMonth++;
-
-        // Mark as seen
-        if (msg.uid) {
-          await client.messageFlagsAdd({ uid: msg.uid }, ["\\Seen"], { uid: true });
-        }
-
-        synced++;
+      } finally {
+        lock.release();
       }
-    } finally {
-      lock.release();
+      await client.logout();
+    } catch (err) {
+      logger.error(`syncEmails: IMAP error for connection ${config.email} of user ${targetEmail}:`, err);
+      try { await client.logout(); } catch { /* ignore */ }
     }
-
-    await client.logout();
-  } catch (err) {
-    logger.error(`syncEmails: IMAP error for ${targetEmail}:`, err);
-    try { await client.logout(); } catch { /* ignore */ }
   }
 
   return synced;
@@ -731,6 +782,12 @@ const sendAiReplyLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    const { taskId, replyBody, recipientEmail } = req.body as Partial<SendAiReplyRequest>;
+    if (!taskId || !replyBody || !recipientEmail) {
+      res.status(400).json({ error: "Bad Request" });
+      return;
+    }
+
     // Auth
     const authResult = await verifyAuthToken(req);
     if (!authResult) {
@@ -744,24 +801,18 @@ const sendAiReplyLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
-    if (req.method !== "POST") {
-      res.status(405).json({ error: "Method Not Allowed. Must be POST." });
-      return;
-    }
-
-    const { taskId, replyBody, recipientEmail } = req.body as Partial<SendAiReplyRequest>;
-    if (!taskId || !replyBody || !recipientEmail) {
-      res.status(400).json({ error: "Bad Request" });
-      return;
-    }
+    // Load original task for subject threading
+    const taskDoc = await db.collection("tasks").doc(taskId).get();
+    const taskData = taskDoc.exists ? taskDoc.data() : null;
+    const originalSubject = taskData?.subject || "Nincs tárgy";
+    const sourceEmail = taskData?.source_email;
 
     // Load email config
-    const configDoc = await db.doc(`users/${authResult.email}/tokens/email_config`).get();
-    if (!configDoc.exists) {
+    const config = await resolveSmtpConfig(authResult.email, sourceEmail);
+    if (!config) {
       res.status(400).json({ error: "No email configuration found. Please connect your email first." });
       return;
     }
-    const config = configDoc.data() as EmailConfig;
 
     if (config.provider === "google") {
       res.status(400).json({ error: "Google email replies are handled via the Gmail API. Use the Gmail interface." });
@@ -774,11 +825,6 @@ const sendAiReplyLogic: express.RequestHandler = async (req, res) => {
     }
 
     const servers = resolveEmailServers(config);
-
-    // Load original task for subject threading
-    const taskDoc = await db.collection("tasks").doc(taskId).get();
-    const taskData = taskDoc.exists ? taskDoc.data() : null;
-    const originalSubject = taskData?.subject || "Nincs tárgy";
 
     // Create nodemailer transport
     const transporter = nodemailer.createTransport({
@@ -837,6 +883,21 @@ const sendManualEmailLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    const { taskId, recipient, subject, body } = req.body as {
+      taskId: string;
+      recipient: string;
+      subject: string;
+      body: string;
+    };
+
+    if (!taskId || typeof taskId !== "string" || taskId.trim() === "" ||
+        !recipient || typeof recipient !== "string" || recipient.trim() === "" ||
+        !subject || typeof subject !== "string" || subject.trim() === "" ||
+        !body || typeof body !== "string" || body.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
+      return;
+    }
+
     // Auth header structure check
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -857,28 +918,38 @@ const sendManualEmailLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
-    const { taskId, recipient, subject, body } = req.body as {
-      taskId: string;
-      recipient: string;
-      subject: string;
-      body: string;
-    };
-
-    if (!taskId || typeof taskId !== "string" || taskId.trim() === "" ||
-        !recipient || typeof recipient !== "string" || recipient.trim() === "" ||
-        !subject || typeof subject !== "string" || subject.trim() === "" ||
-        !body || typeof body !== "string" || body.trim() === "") {
-      res.status(400).json({ error: "Bad Request" });
-      return;
+    let sourceMailbox: string | undefined;
+    if (taskId) {
+      const taskDoc = await db.collection("tasks").doc(taskId).get();
+      if (taskDoc.exists) {
+        const data = taskDoc.data();
+        sourceMailbox = data?.source_mailbox || data?.source_email;
+      }
     }
 
-    // Load accountant SMTP config
-    const configDoc = await db.doc(`users/${userEmail}/tokens/email_config`).get();
-    if (!configDoc.exists) {
-      res.status(400).json({ error: "Email configuration missing. Please connect your email first." });
+    if (!sourceMailbox) {
+      sourceMailbox = userEmail;
+    }
+
+    // Query email_connections subcollection specifically matching this email address
+    let config: EmailConfig | null = null;
+    const connSnap = await db.collection("users")
+      .doc(userEmail)
+      .collection("email_connections")
+      .where("email", "==", sourceMailbox)
+      .limit(1)
+      .get();
+    if (!connSnap.empty) {
+      config = connSnap.docs[0].data() as EmailConfig;
+    }
+
+    if (!config || !config.password) {
+      res.status(400).json({
+        error: "SMTP_NOT_CONFIGURED",
+        message: `Nincs beállítva kimenő SMTP fiók ehhez a címhez: ${sourceMailbox}`
+      });
       return;
     }
-    const config = configDoc.data() as EmailConfig;
     const servers = resolveEmailServers(config);
 
     // Setup nodemailer
@@ -934,6 +1005,12 @@ const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    const { text } = req.body as { text: string };
+    if (!text || typeof text !== "string" || text.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
+      return;
+    }
+
     // Auth header structure check
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -951,12 +1028,6 @@ const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
     const isSubscribed = await checkSubscription(userEmail);
     if (!isSubscribed) {
       res.status(403).json({ error: "Forbidden: Active subscription required" });
-      return;
-    }
-
-    const { text } = req.body as { text: string };
-    if (!text || typeof text !== "string" || text.trim() === "") {
-      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -1045,6 +1116,12 @@ const archiveTaskLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    const { taskId } = req.body as { taskId: string };
+    if (!taskId || typeof taskId !== "string" || taskId.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
+      return;
+    }
+
     // Auth header structure check
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -1061,12 +1138,6 @@ const archiveTaskLogic: express.RequestHandler = async (req, res) => {
     const isSubscribed = await checkSubscription(verifiedUser.email);
     if (!isSubscribed) {
       res.status(403).json({ error: "Forbidden: Active subscription required" });
-      return;
-    }
-
-    const { taskId } = req.body as { taskId: string };
-    if (!taskId || typeof taskId !== "string" || taskId.trim() === "") {
-      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -1106,6 +1177,12 @@ const restoreTaskLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    const { taskId } = req.body as { taskId: string };
+    if (!taskId || typeof taskId !== "string" || taskId.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
+      return;
+    }
+
     // Auth header structure check
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -1122,12 +1199,6 @@ const restoreTaskLogic: express.RequestHandler = async (req, res) => {
     const isSubscribed = await checkSubscription(verifiedUser.email);
     if (!isSubscribed) {
       res.status(403).json({ error: "Forbidden: Active subscription required" });
-      return;
-    }
-
-    const { taskId } = req.body as { taskId: string };
-    if (!taskId || typeof taskId !== "string" || taskId.trim() === "") {
-      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -1161,6 +1232,27 @@ const restoreTaskLogic: express.RequestHandler = async (req, res) => {
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json());
+
+const registeredRoutes = [
+  "/handleIncomingEmail",
+  "/improveEmailDraft",
+  "/sendManualEmail",
+  "/syncEmailsNow",
+  "/archiveTask",
+  "/restoreTask",
+  "/handleFeedbackSubmit",
+  "/sendAiReply"
+];
+
+app.use((req, res, next) => {
+  if (registeredRoutes.includes(req.path)) {
+    if (req.method !== "POST" && req.method !== "OPTIONS") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+  }
+  next();
+});
 
 app.post("/handleIncomingEmail", handleIncomingEmailLogic);
 app.post("/improveEmailDraft", improveEmailDraftLogic);
