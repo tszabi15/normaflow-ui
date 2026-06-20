@@ -987,22 +987,35 @@ export const cleanupExpiredTasks = onSchedule({ schedule: "0 0 * * *" }, async (
   try {
     const expiredTasksQuery = await db.collection("tasks")
       .where("status", "==", "archived")
-      .where("archivedAt", "<", thirtyDaysAgo)
       .get();
 
     if (expiredTasksQuery.empty) {
-      logger.info("No expired archived tasks found to delete.");
+      logger.info("No archived tasks found.");
       return;
     }
 
     const batch = db.batch();
+    let count = 0;
+
     expiredTasksQuery.docs.forEach((doc) => {
-      logger.info(`Adding task ID ${doc.id} to deletion batch.`);
-      batch.delete(doc.ref);
+      const data = doc.data();
+      const archivedAt = data.archivedAt;
+      if (archivedAt) {
+        const archivedDate = archivedAt.toDate ? archivedAt.toDate() : new Date(archivedAt);
+        if (archivedDate < thirtyDaysAgo) {
+          logger.info(`Adding task ID ${doc.id} to deletion batch.`);
+          batch.delete(doc.ref);
+          count++;
+        }
+      }
     });
 
-    await batch.commit();
-    logger.info(`Successfully deleted ${expiredTasksQuery.size} expired archived tasks.`);
+    if (count > 0) {
+      await batch.commit();
+      logger.info(`Successfully deleted ${count} expired archived tasks.`);
+    } else {
+      logger.info("No expired archived tasks older than 30 days found.");
+    }
   } catch (err: any) {
     logger.error("Error in cleanupExpiredTasks:", err);
   }
