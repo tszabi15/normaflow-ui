@@ -1,0 +1,16 @@
+# Dependency directories
+node_modules/
+functions/node_modules/
+
+# Production builds
+normaflow-ui/dist/
+functions/lib/
+
+# Firebase logs and cache
+*.log
+.firebase/
+functions/.runtimeconfig.json
+
+# Environment variables (Titkos kulcsok!)
+.env
+.env.local
