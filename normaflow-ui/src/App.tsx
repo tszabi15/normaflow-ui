@@ -560,14 +560,17 @@ function PaywallView({
             </p>
           </div>
 
-          <div className="mb-6 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-6 text-center">
-            <div className="flex items-baseline justify-center gap-1">
-              <span className="text-4xl font-bold text-white">14.990</span>
-              <span className="text-lg text-slate-400">Ft / hó</span>
-            </div>
-            <p className="mt-2 text-xs text-slate-500">
-              ÁFA-val együtt · Havi előfizetés · Bármikor lemondható
+          <div className="mb-6 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4 text-center">
+            <p className="text-sm text-slate-300 font-medium leading-relaxed">
+              Nincs aktív előfizetése. A NormaFlow SaaS használatához kérjük, válasszon egy előfizetési csomagot.
             </p>
+          </div>
+
+          <div className="mb-6 rounded-xl border border-slate-800 bg-slate-950/40 p-4 text-center">
+            <div className="flex items-baseline justify-center gap-1">
+              <span className="text-3xl font-bold text-white">14.990</span>
+              <span className="text-sm text-slate-400">Ft / hó</span>
+            </div>
           </div>
 
           <ul className="mb-8 space-y-3">
@@ -1328,12 +1331,14 @@ function MfaSettingsCard() {
 export default function App() {
   const [view, setView] = useState<AppView>('login')
   const [userEmail, setUserEmail] = useState<string | null>(null)
-  const [isSubscribed, setIsSubscribed] = useState(false)
+  const [subscriptionStatus, setSubscriptionStatus] = useState<string>('none')
   const [devBypass, setDevBypass] = useState(false)
   const [tasks, setTasks] = useState<Task[]>([])
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('Összes')
   const [completingIds, setCompletingIds] = useState<Set<string>>(new Set())
   const [toasts, setToasts] = useState<Toast[]>([])
+
+  const hasAccess = subscriptionStatus === 'active' || devBypass
 
   // AI automation states
   const [activeTab, setActiveTab] = useState<'tasks' | 'automation'>('tasks')
@@ -1362,16 +1367,37 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       if (user) {
         setUserEmail(user.email)
-        if (view === 'login') {
-          setView('paywall')
-        }
+        setView('dashboard')
       } else {
         setUserEmail(null)
         setView('login')
       }
     })
     return () => unsubscribe()
-  }, [view])
+  }, [])
+
+  // Listen for user subscriptionStatus in Firestore in real time
+  useEffect(() => {
+    if (!userEmail) {
+      setSubscriptionStatus('none')
+      return
+    }
+
+    const userRef = doc(db, 'users', userEmail)
+    const unsubscribe = onSnapshot(userRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data()
+        setSubscriptionStatus(data?.subscriptionStatus === 'active' ? 'active' : 'none')
+      } else {
+        setSubscriptionStatus('none')
+      }
+    }, (error) => {
+      console.error('Error fetching subscription status:', error)
+      setSubscriptionStatus('none')
+    })
+
+    return () => unsubscribe()
+  }, [userEmail])
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
@@ -1379,7 +1405,7 @@ export default function App() {
 
   const handleLogin = (email: string) => {
     setUserEmail(email)
-    setView('paywall')
+    setView('dashboard')
   }
 
   const handleLogout = async () => {
@@ -1389,7 +1415,7 @@ export default function App() {
       console.error('Logout error:', err)
     }
     setUserEmail(null)
-    setIsSubscribed(false)
+    setSubscriptionStatus('none')
     setDevBypass(false)
     setView('login')
     setCategoryFilter('Összes')
@@ -1399,14 +1425,19 @@ export default function App() {
     setAutomationEnabled(false)
   }
 
-  const handleSubscribe = () => {
-    setIsSubscribed(true)
-    setView('dashboard')
+  const handleSubscribe = async () => {
+    if (!userEmail) return
+    try {
+      const userRef = doc(db, 'users', userEmail)
+      await setDoc(userRef, { subscriptionStatus: 'active' }, { merge: true })
+      setSubscriptionStatus('active')
+    } catch (err) {
+      console.error('Error starting subscription:', err)
+    }
   }
 
   const handleDevBypass = () => {
     setDevBypass(true)
-    setView('dashboard')
   }
 
   const handleCompleteTask = async (id: string) => {
@@ -1478,7 +1509,7 @@ export default function App() {
 
   // Real-time Firestore tasks subscription
   useEffect(() => {
-    if (view !== 'dashboard' || !userEmail) return
+    if (!hasAccess || !userEmail) return
 
     const q = query(
       collection(db, 'tasks'),
@@ -1538,11 +1569,11 @@ export default function App() {
     })
 
     return () => unsubscribe()
-  }, [view, userEmail])
+  }, [hasAccess, userEmail])
 
   // Load auto-responder settings from Firestore on mount/login
   useEffect(() => {
-    if (view !== 'dashboard' || !userEmail) return
+    if (!hasAccess || !userEmail) return
 
     const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
     const fetchSettings = async () => {
@@ -1561,15 +1592,13 @@ export default function App() {
     }
 
     fetchSettings()
-  }, [view, userEmail])
-
-  const hasAccess = isSubscribed || devBypass
+  }, [hasAccess, userEmail])
 
   return (
     <>
       {view === 'login' && <LoginView onLogin={handleLogin} />}
 
-      {view === 'paywall' && userEmail && (
+      {view !== 'login' && userEmail && !hasAccess && (
         <PaywallView
           userEmail={userEmail}
           onSubscribe={handleSubscribe}
@@ -1578,7 +1607,7 @@ export default function App() {
         />
       )}
 
-      {view === 'dashboard' && userEmail && hasAccess && (
+      {view !== 'login' && userEmail && hasAccess && (
         <MainDashboard
           userEmail={userEmail}
           tasks={tasks}

@@ -16,7 +16,8 @@ interface IncomingEmailRequest {
   sender: string;
   subject?: string;
   textContent: string;
-  userId: string;
+  userEmail?: string;
+  userId?: string;
 }
 
 interface FeedbackSubmitRequest {
@@ -29,7 +30,7 @@ interface FeedbackSubmitRequest {
 /**
  * SUBSYSTEM 1: handleIncomingEmail
  * Replaces Make.com e-mail to task pipeline.
- * Input: POST JSON payload: { sender, subject, textContent, userId }
+ * Input: POST JSON payload: { sender, subject, textContent, userEmail, userId }
  */
 export const handleIncomingEmail = onRequest({
   cors: true,
@@ -53,18 +54,20 @@ export const handleIncomingEmail = onRequest({
       return;
     }
 
-    const { sender, subject, textContent, userId } = req.body as Partial<IncomingEmailRequest>;
+    const { sender, subject, textContent, userEmail, userId } = req.body as Partial<IncomingEmailRequest>;
+    const targetEmail = userEmail || userId;
 
     // Step A: Validation & Strict Spam Filter
-    if (!sender || !textContent || !userId) {
-      logger.warn("Validation failed: missing sender, textContent, or userId");
-      res.status(400).json({ error: "Missing required fields: sender, textContent, and userId are all required." });
+    if (!sender || !textContent || !targetEmail) {
+      logger.warn("Validation failed: missing sender, textContent, or targetEmail");
+      res.status(400).json({ error: "Missing required fields: sender, textContent, and userEmail/userId are required." });
       return;
     }
 
     const senderLower = sender.toLowerCase();
-    const spamKeywords = ["noreply", "newsletter", "spam", "facebook", "linkedin", "marketing"];
-    const isSpamSender = spamKeywords.some(keyword => senderLower.includes(keyword));
+    const parts = senderLower.split("@");
+    const localPart = parts[0] || "";
+    const isSpamSender = localPart === "noreply" || localPart === "newsletter" || senderLower.includes("spam");
     const isTooShort = textContent.length < 20;
 
     if (isSpamSender || isTooShort) {
@@ -75,9 +78,19 @@ export const handleIncomingEmail = onRequest({
       return;
     }
 
+    // Subscription check: verify user has an active subscription
+    const userDoc = await db.collection("users").doc(targetEmail).get();
+    if (!userDoc.exists || userDoc.data()?.subscriptionStatus !== "active") {
+      logger.warn(`Forbidden request to handleIncomingEmail: user ${targetEmail} does not have an active subscription`);
+      res.status(403).json({
+        error: "Forbidden: Account requires an active subscription to process background email automation."
+      });
+      return;
+    }
+
     // Step B: Fetch Accountant's Custom Rules
-    logger.info(`Fetching auto-responder settings for userId: ${userId}`);
-    const autoResponderRef = db.doc(`users/${userId}/settings/auto_responder`);
+    logger.info(`Fetching auto-responder settings for userEmail: ${targetEmail}`);
+    const autoResponderRef = db.doc(`users/${targetEmail}/settings/auto_responder`);
     const rulesDoc = await autoResponderRef.get();
 
     let automationEnabled = false;
@@ -93,7 +106,7 @@ export const handleIncomingEmail = onRequest({
 
     // Step C: Cost-Optimized AI Engine
     if (automationEnabled && promptRules.trim()) {
-      logger.info(`Triggering OpenAI gpt-4o-mini for userId: ${userId}`);
+      logger.info(`Triggering OpenAI gpt-4o-mini for userEmail: ${targetEmail}`);
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       
       const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy a beérkező e-mailre generálj egy hivatalos, udvarias választervezetet a könyvelő által meghatározott egyedi szabályok alapján.\n\nKönyvelő egyedi szabályai:\n${promptRules}`;
@@ -110,7 +123,7 @@ export const handleIncomingEmail = onRequest({
 
       aiReply = response.choices[0]?.message?.content || null;
     } else {
-      logger.info(`AI automation disabled or prompt rules missing/empty for userId: ${userId}`);
+      logger.info(`AI automation disabled or prompt rules missing/empty for userEmail: ${targetEmail}`);
     }
 
     // Step D: Structured Firestore Ingestion
@@ -125,7 +138,7 @@ export const handleIncomingEmail = onRequest({
       received_at: new Date().toISOString(),
       sender,
       subject: subject || "",
-      user_email: userId, // map to userId as requested
+      user_email: targetEmail, // map to targetEmail
       status: "pending",
       ai_status: aiStatus,
       ai_reply: aiReply,
@@ -194,6 +207,14 @@ export const handleFeedbackSubmit = onRequest({
     if (!verifiedUserEmail) {
       logger.warn("Unauthorized request to handleFeedbackSubmit: token contains no email");
       res.status(401).send("Unauthorized: Token contains no email");
+      return;
+    }
+
+    // Subscription check: verify user has an active subscription
+    const userDoc = await admin.firestore().collection('users').doc(verifiedUserEmail).get();
+    if (!userDoc.exists || userDoc.data()?.subscriptionStatus !== 'active') {
+      logger.warn(`Forbidden request to handleFeedbackSubmit: user ${verifiedUserEmail} does not have an active subscription`);
+      res.status(403).send("Forbidden: Active subscription required to submit feedback");
       return;
     }
 
