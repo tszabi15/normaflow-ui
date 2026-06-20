@@ -15,6 +15,9 @@ import {
   Sparkles,
   Lightbulb,
   Phone,
+  ShieldAlert,
+  Trash2,
+  Plus,
 } from 'lucide-react'
 
 // Import components and types
@@ -22,7 +25,7 @@ import type { Task, TaskCategory, TaskPriority } from './types/task'
 import AutoResponder from './components/dashboard/AutoResponder'
 import FeedbackModal from './components/dashboard/FeedbackModal'
 import { db, auth } from './firebase'
-import { collection, query, where, onSnapshot, doc, updateDoc, setDoc, getDoc } from 'firebase/firestore'
+import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc } from 'firebase/firestore'
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
@@ -620,12 +623,27 @@ function TaskCard({
   task,
   isCompleting,
   onComplete,
+  onWriteReply,
+  onRestoreTask,
 }: {
   task: Task
   isCompleting: boolean
   onComplete: (id: string) => void
+  onWriteReply: (task: Task) => void
+  onRestoreTask: (id: string) => void
 }) {
+  const [isExpanded, setIsExpanded] = useState(false)
   const style = PRIORITY_STYLES[task.priority]
+
+  const getDaysRemaining = (archivedAtStr?: string): number => {
+    if (!archivedAtStr) return 30
+    const archivedDate = new Date(archivedAtStr)
+    const expirationDate = new Date(archivedDate.getTime() + 30 * 24 * 60 * 60 * 1000)
+    const today = new Date()
+    const diffTime = expirationDate.getTime() - today.getTime()
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
+    return Math.max(0, Math.min(30, diffDays))
+  }
 
   return (
     <article
@@ -649,6 +667,11 @@ function TaskCard({
             <span className="rounded-md bg-slate-800 px-2 py-0.5 text-[10px] font-medium text-slate-400">
               {task.category}
             </span>
+            {task.status === 'archived' && (
+              <span className="inline-flex items-center rounded-md bg-rose-500/10 border border-rose-500/20 px-2 py-0.5 text-[10px] font-medium text-rose-400">
+                {getDaysRemaining(task.archivedAt)} nap maradt a törlésig
+              </span>
+            )}
           </div>
 
           <h3 className="text-base font-bold leading-snug text-white">
@@ -701,18 +724,124 @@ function TaskCard({
               </p>
             </div>
           )}
+
+          {/* Accordion Expand Trigger */}
+          <div className="mt-4 border-t border-slate-800/50 pt-3">
+            <button
+              type="button"
+              onClick={() => setIsExpanded(!isExpanded)}
+              className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-400 hover:text-indigo-300 transition-colors focus:outline-none"
+            >
+              <span>{isExpanded ? 'Részletek elrejtése' : 'Részletek megtekintése'}</span>
+              <svg
+                className={`h-4 w-4 transform transition-transform duration-200 ${isExpanded ? 'rotate-180' : 'rotate-0'}`}
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+          </div>
         </div>
 
-        <button
-          type="button"
-          onClick={() => onComplete(task.id)}
-          disabled={isCompleting}
-          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 transition-all hover:border-emerald-500/50 hover:bg-emerald-500/20 hover:shadow-md hover:shadow-emerald-900/30 active:scale-95 disabled:opacity-50"
-          aria-label="Feladat késznek jelölése"
-          title="Kész"
-        >
-          <Check className="h-5 w-5" />
-        </button>
+        {task.status === 'archived' ? (
+          <button
+            type="button"
+            onClick={() => onRestoreTask(task.id)}
+            className="flex h-9 shrink-0 items-center justify-center rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-3 text-xs font-semibold text-indigo-300 transition-all hover:border-indigo-500/50 hover:bg-indigo-500/20 active:scale-95"
+            aria-label="Feladat visszaállítása"
+            title="Visszaállítás"
+          >
+            Visszaállítás
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onComplete(task.id)}
+            disabled={isCompleting}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 transition-all hover:border-emerald-500/50 hover:bg-emerald-500/20 hover:shadow-md hover:shadow-emerald-900/30 active:scale-95 disabled:opacity-50"
+            aria-label="Feladat késznek jelölése"
+            title="Kész"
+          >
+            <Check className="h-5 w-5" />
+          </button>
+        )}
+      </div>
+
+      {/* Accordion Collapsible Panel */}
+      <div
+        className={`transition-all duration-300 ease-in-out overflow-hidden ${
+          isExpanded ? 'max-h-[800px] opacity-100 mt-4 border-t border-slate-800 pt-4' : 'max-h-0 opacity-0'
+        }`}
+      >
+        <div className="space-y-4">
+          {/* AI Summary */}
+          {task.ai_summary ? (
+            <div>
+              <h4 className="text-[10px] font-bold uppercase tracking-wider text-indigo-400 mb-1">AI Feladat Összegzés</h4>
+              <p className="text-xs text-slate-300 bg-slate-950/50 p-3 rounded-lg border border-slate-800/80 whitespace-pre-line leading-relaxed">
+                {task.ai_summary}
+              </p>
+            </div>
+          ) : (
+            <div>
+              <h4 className="text-[10px] font-bold uppercase tracking-wider text-indigo-400 mb-1">AI Feladat Összegzés</h4>
+              <p className="text-xs text-slate-500 italic bg-slate-950/30 p-3 rounded-lg border border-slate-800/30">
+                Nincs AI összegzés ehhez a feladathoz.
+              </p>
+            </div>
+          )}
+
+          {/* Original Message Text Content */}
+          {task.textContent ? (
+            <div>
+              <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Eredeti Üzenet</h4>
+              <pre className="max-h-48 overflow-y-auto text-[11px] text-slate-400 bg-slate-950/70 p-3 rounded-lg border border-slate-800/80 whitespace-pre-wrap font-mono leading-normal shadow-inner">
+                {task.textContent}
+              </pre>
+            </div>
+          ) : (
+            <div>
+              <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Eredeti Üzenet</h4>
+              <p className="text-xs text-slate-500 italic bg-slate-950/30 p-3 rounded-lg border border-slate-800/30">
+                Nincs elérhető eredeti üzenetszöveg.
+              </p>
+            </div>
+          )}
+
+          {/* Action Area: Write Reply & Complete or Restore */}
+          <div className="flex justify-end gap-2.5 pt-2 border-t border-slate-800/40">
+            {task.status === 'archived' ? (
+              <button
+                type="button"
+                onClick={() => onRestoreTask(task.id)}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 font-semibold text-xs px-4 py-2 transition-all active:scale-95"
+              >
+                <span>Visszaállítás</span>
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => onComplete(task.id)}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 font-semibold text-xs px-4 py-2 transition-all active:scale-95"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  <span>Feladat Elvégzése</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onWriteReply(task)}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs px-4 py-2 shadow-lg transition-all active:scale-95 hover:shadow-indigo-500/20"
+                >
+                  <Mail className="h-3.5 w-3.5" />
+                  <span>Válasz írása</span>
+                </button>
+              </>
+            )}
+          </div>
+        </div>
       </div>
     </article>
   )
@@ -736,6 +865,10 @@ function MainDashboard({
   onOpenFeedback,
   processedEmailsThisMonth,
   tier,
+  enforceWhitelist,
+  onToggleWhitelist,
+  onWriteReply,
+  onRestoreTask,
 }: {
   userEmail: string
   tasks: Task[]
@@ -752,29 +885,52 @@ function MainDashboard({
   onOpenFeedback: () => void
   processedEmailsThisMonth: number
   tier: string
+  enforceWhitelist: boolean
+  onToggleWhitelist: (checked: boolean) => void
+  onWriteReply: (task: Task) => void
+  onRestoreTask: (id: string) => void
 }) {
   const limit = tier === 'pro' ? 1500 : tier === 'ultra' ? 5000 : 500
 
-  const pendingForUser = useMemo(
+  const [taskStatusFilter, setTaskStatusFilter] = useState<'active' | 'archived'>('active')
+  const [searchQuery, setSearchQuery] = useState('')
+
+  const tasksForUser = useMemo(
     () =>
       tasks.filter(
-        (t) => t.status === 'pending' && t.user_email === userEmail,
+        (t) => t.user_email === userEmail,
       ),
     [tasks, userEmail],
   )
 
-  const filteredTasks = useMemo(() => {
-    const base = pendingForUser
-    const filtered =
-      categoryFilter === 'Összes'
-        ? base
-        : base.filter((t) => t.category === categoryFilter)
+  const pendingForUser = useMemo(
+    () =>
+      tasksForUser.filter((t) => t.status === 'active'),
+    [tasksForUser],
+  )
 
-    return [...filtered].sort((a, b) => {
+  const filteredTasks = useMemo(() => {
+    let base = tasksForUser.filter((t) => t.status === taskStatusFilter)
+
+    if (categoryFilter !== 'Összes') {
+      base = base.filter((t) => t.category === categoryFilter)
+    }
+
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase()
+      base = base.filter((t) => 
+        (t.sender && t.sender.toLowerCase().includes(q)) ||
+        (t.subject && t.subject.toLowerCase().includes(q)) ||
+        (t.textContent && t.textContent.toLowerCase().includes(q)) ||
+        (t.summary && t.summary.toLowerCase().includes(q))
+      )
+    }
+
+    return [...base].sort((a, b) => {
       if (b.priority !== a.priority) return b.priority - a.priority
       return new Date(a.received_at).getTime() - new Date(b.received_at).getTime()
     })
-  }, [pendingForUser, categoryFilter])
+  }, [tasksForUser, taskStatusFilter, categoryFilter, searchQuery])
 
   const metrics = useMemo(() => {
     const counts: Record<CategoryFilter, number> = {
@@ -942,6 +1098,29 @@ function MainDashboard({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-3">
+                  {/* Global Search Input */}
+                  <div className="relative w-64">
+                    <input
+                      type="text"
+                      placeholder="Keresés (feladó, tárgy, tartalom)..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="w-full rounded-xl border border-slate-700 bg-slate-950/70 pl-9 pr-4 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 shadow-inner"
+                    />
+                    <svg
+                      className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-500"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                      />
+                    </svg>
+                  </div>
                   {/* Mobile Tab Switcher */}
                   <div className="flex items-center gap-1 rounded-lg bg-slate-950 p-1 border border-slate-800/80 lg:hidden">
                     <button
@@ -1017,6 +1196,41 @@ function MainDashboard({
               </div>
             </header>
 
+            {/* Secondary navigation for Active / Archived */}
+            <div className="border-b border-slate-800 bg-slate-900/30 px-4 py-2 sm:px-6 flex items-center justify-between gap-4">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setTaskStatusFilter('active')}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
+                    taskStatusFilter === 'active'
+                      ? 'bg-indigo-600/15 text-indigo-300 border border-indigo-500/30'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/30'
+                  }`}
+                >
+                  Aktív Feladatok
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTaskStatusFilter('archived')}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-all flex items-center gap-1.5 ${
+                    taskStatusFilter === 'archived'
+                      ? 'bg-indigo-600/15 text-indigo-300 border border-indigo-500/30'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/30'
+                  }`}
+                >
+                  <Trash2 className="h-3.5 w-3.5 animate-pulse text-indigo-400" />
+                  <span>Kuka / Archivált</span>
+                </button>
+              </div>
+
+              <div className="text-[10px] text-slate-500 font-medium hidden sm:block">
+                {taskStatusFilter === 'archived'
+                  ? 'A Kukában lévő elemek 30 nap után automatikusan törlődnek.'
+                  : 'Feldolgozásra váró e-mailek prioritási sorrendben.'}
+              </div>
+            </div>
+
             {/* Task List */}
             <main className="flex-1 overflow-y-auto p-4 sm:p-6">
               {processedEmailsThisMonth >= limit && (
@@ -1055,6 +1269,8 @@ function MainDashboard({
                       task={task}
                       isCompleting={completingIds.has(task.id)}
                       onComplete={onCompleteTask}
+                      onWriteReply={onWriteReply}
+                      onRestoreTask={onRestoreTask}
                     />
                   ))}
                 </div>
@@ -1100,13 +1316,218 @@ function MainDashboard({
                 onSave={onSaveAutomation}
                 limitExceeded={processedEmailsThisMonth >= limit}
               />
-              <div className="mx-auto max-w-3xl px-4 pb-12 sm:px-6">
+              <div className="mx-auto max-w-3xl px-4 pb-12 sm:px-6 space-y-6">
+                <WhitelistSettingsCard
+                  userEmail={userEmail}
+                  enforceWhitelist={enforceWhitelist}
+                  onToggleWhitelist={onToggleWhitelist}
+                />
                 <EmailConfigCard userEmail={userEmail} />
                 <MfaSettingsCard />
               </div>
             </main>
           </>
         )}
+      </div>
+    </div>
+  )
+}
+
+// ─── WhitelistSettingsCard ──────────────────────────────────────────────────
+
+interface ClientRecord {
+  id: string
+  email: string
+}
+
+function WhitelistSettingsCard({
+  userEmail,
+  enforceWhitelist,
+  onToggleWhitelist,
+}: {
+  userEmail: string
+  enforceWhitelist: boolean
+  onToggleWhitelist: (checked: boolean) => void
+}) {
+  const [clients, setClients] = useState<ClientRecord[]>([])
+  const [newEmail, setNewEmail] = useState('')
+  const [isAdding, setIsAdding] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!userEmail) return
+    const clientsRef = collection(db, `users/${userEmail}/clients`)
+    const unsubscribe = onSnapshot(clientsRef, (snap) => {
+      const loaded: ClientRecord[] = []
+      snap.forEach((doc) => {
+        loaded.push({ id: doc.id, email: doc.data().email || '' })
+      })
+      // Sort alphabetically by email
+      loaded.sort((a, b) => a.email.localeCompare(b.email))
+      setClients(loaded)
+    }, (err) => {
+      console.error('Error fetching clients whitelist:', err)
+    })
+    return () => unsubscribe()
+  }, [userEmail])
+
+  const handleAddClient = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    const trimmed = newEmail.trim().toLowerCase()
+    if (!trimmed) return
+    if (!trimmed.includes('@')) {
+      setError('Kérjük, érvényes e-mail címet adjon meg.')
+      return
+    }
+    if (clients.some((c) => c.email.toLowerCase() === trimmed)) {
+      setError('Ez az ügyfél már szerepel a fehérlistán.')
+      return
+    }
+
+    setIsAdding(true)
+    try {
+      const clientsRef = collection(db, `users/${userEmail}/clients`)
+      await addDoc(clientsRef, { email: trimmed })
+      setNewEmail('')
+    } catch (err) {
+      console.error('Error adding client to whitelist:', err)
+      setError('Nem sikerült hozzáadni az ügyfelet.')
+    } finally {
+      setIsAdding(false)
+    }
+  }
+
+  const handleDeleteClient = async (id: string) => {
+    try {
+      const clientDocRef = doc(db, `users/${userEmail}/clients`, id)
+      await deleteDoc(clientDocRef)
+    } catch (err) {
+      console.error('Error deleting client from whitelist:', err)
+    }
+  }
+
+  return (
+    <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md animate-fade-in text-slate-100">
+      <div className="absolute -left-24 -top-24 h-48 w-48 rounded-full bg-violet-600/5 blur-3xl" />
+
+      {/* Header & Toggle */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/80 pb-6">
+        <div>
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="h-5 w-5 text-indigo-400" />
+            <h3 className="text-lg font-bold tracking-tight text-white">Ügyfél Ellenőrzés és Fehérlista</h3>
+          </div>
+          <p className="mt-1 text-sm text-slate-400">
+            Szabályozza, hogy az AI auto-responder csak regisztrált ügyfeleknek válaszoljon-e.
+          </p>
+        </div>
+
+        {/* Toggle Switch */}
+        <div className="flex items-center gap-3">
+          <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+            Szigorú fehérlista:
+          </span>
+          <button
+            type="button"
+            onClick={() => onToggleWhitelist(!enforceWhitelist)}
+            className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 focus:ring-offset-slate-900 ${
+              enforceWhitelist ? 'bg-indigo-600' : 'bg-slate-700'
+            }`}
+            aria-checked={enforceWhitelist}
+            role="switch"
+          >
+            <span
+              className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
+                enforceWhitelist ? 'translate-x-5' : 'translate-x-0'
+              }`}
+            />
+          </button>
+          <span
+            className={`text-xs font-bold uppercase ${
+              enforceWhitelist ? 'text-indigo-400' : 'text-slate-500'
+            }`}
+          >
+            {enforceWhitelist ? 'AKTÍV' : 'INAKTÍV'}
+          </span>
+        </div>
+      </div>
+
+      {/* Description Info Banner */}
+      <div className="mt-4 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4 flex gap-3">
+        <Mail className="h-5 w-5 shrink-0 text-indigo-400 mt-0.5" />
+        <div className="text-xs text-slate-300 leading-relaxed">
+          {enforceWhitelist ? (
+            <p>
+              <strong>Szigorú fehérlista aktív:</strong> Az AI csak akkor küld automatikus választervezetet, ha a feladó e-mail címe szerepel az alábbi listában. Bárki más által küldött levelet a rendszer feldolgozás nélkül átugrik.
+            </p>
+          ) : (
+            <p>
+              <strong>Fehérlista ellenőrzés kikapcsolva:</strong> Minden beérkező e-mailt feldolgoz az AI auto-responder, függetlenül attól, hogy a feladó szerepel-e a listában (kivéve a nyilvánvaló spam/hírlevél címeket).
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Customer Management Form */}
+      <div className="mt-6">
+        <h4 className="text-sm font-semibold text-slate-200 mb-3">Engedélyezett Ügyfelek Kezelése</h4>
+        <form onSubmit={handleAddClient} className="flex gap-2">
+          <input
+            type="email"
+            placeholder="ugyfel@cegnev.hu"
+            value={newEmail}
+            onChange={(e) => setNewEmail(e.target.value)}
+            disabled={isAdding}
+            className="flex-1 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+          <button
+            type="submit"
+            disabled={isAdding || !newEmail.trim()}
+            className="flex items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 disabled:opacity-50"
+          >
+            <Plus className="h-4 w-4" />
+            <span>Hozzáadás</span>
+          </button>
+        </form>
+        {error && <p className="mt-2 text-xs text-rose-400">{error}</p>}
+      </div>
+
+      {/* Clients List */}
+      <div className="mt-4">
+        <div className="max-h-60 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/40">
+          {clients.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-500">
+              Nincsenek ügyfelek a fehérlistán.
+            </div>
+          ) : (
+            <table className="w-full text-left text-xs text-slate-300">
+              <thead>
+                <tr className="border-b border-slate-800/80 bg-slate-900/30 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                  <th className="px-4 py-2.5">E-mail cím</th>
+                  <th className="px-4 py-2.5 text-right">Művelet</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/50">
+                {clients.map((client) => (
+                  <tr key={client.id} className="hover:bg-slate-900/20">
+                    <td className="px-4 py-2.5 font-medium">{client.email}</td>
+                    <td className="px-4 py-2.5 text-right">
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteClient(client.id)}
+                        className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-slate-500 hover:bg-rose-500/10 hover:text-rose-400 transition-all"
+                        title="Ügyfél törlése"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       </div>
     </div>
   )
@@ -1691,9 +2112,116 @@ export default function App() {
   const [promptRules, setPromptRules] = useState(
     'Ha az ügyfél számlát kér, válaszolj udvariasan, hogy feldolgozzuk és küldjük. Válasz végére írd oda: Üdvözlettel, NormaFlow Asszisztens.'
   )
+  const [enforceWhitelist, setEnforceWhitelist] = useState(true)
   
-  // Feedback modal state
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false)
+
+  // Manual Reply states & actions
+  const [replyTask, setReplyTask] = useState<Task | null>(null)
+  const [replyRecipient, setReplyRecipient] = useState('')
+  const [replySubject, setReplySubject] = useState('')
+  const [replyBody, setReplyBody] = useState('')
+  const [isImprovingDraft, setIsImprovingDraft] = useState(false)
+  const [isSendingReply, setIsSendingReply] = useState(false)
+
+  const handleWriteReply = (task: Task) => {
+    setReplyTask(task)
+    setReplyRecipient(task.sender)
+    setReplySubject(task.subject.startsWith('Re:') ? task.subject : `Re: ${task.subject}`)
+    setReplyBody(task.ai_reply || '')
+  }
+
+  const handleImproveDraft = async () => {
+    if (!replyBody.trim()) return
+    setIsImprovingDraft(true)
+    try {
+      const user = auth.currentUser
+      if (!user) throw new Error('Nem bejelentkezett felhasználó')
+      const token = await user.getIdToken()
+
+      const response = await fetch('https://improveemaildraft-cdaanjspxq-uc.a.run.app', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ text: replyBody }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Hiba történt a feljavítás során')
+      }
+
+      const data = await response.json()
+      if (data.text) {
+        setReplyBody(data.text)
+        const toastId = generateId()
+        setToasts((prev) => [
+          ...prev,
+          {
+            id: toastId,
+            message: 'AI Válasz feljavítva!',
+            taskSummary: 'A piszkozat sikeresen finomítva lett.',
+          },
+        ])
+      }
+    } catch (err: any) {
+      console.error(err)
+      alert('Nem sikerült feljavítani a piszkozatot: ' + err.message)
+    } finally {
+      setIsImprovingDraft(false)
+    }
+  }
+
+  const handleSendManualReply = async () => {
+    if (!replyTask) return
+    if (!replyRecipient.trim() || !replySubject.trim() || !replyBody.trim()) {
+      alert('Minden mezőt ki kell tölteni a küldéshez.')
+      return
+    }
+    setIsSendingReply(true)
+    try {
+      const user = auth.currentUser
+      if (!user) throw new Error('Nem bejelentkezett felhasználó')
+      const token = await user.getIdToken()
+
+      const response = await fetch('https://sendmanualemail-cdaanjspxq-uc.a.run.app', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          taskId: replyTask.id,
+          recipient: replyRecipient,
+          subject: replySubject,
+          body: replyBody,
+        }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.message || 'Sikertelen e-mail küldés.')
+      }
+
+      setReplyTask(null)
+
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'E-mail elküldve',
+          taskSummary: `Sikeres válasz a következőnek: ${replyRecipient}`,
+        },
+      ])
+    } catch (err: any) {
+      console.error(err)
+      alert('Hiba az e-mail küldése során: ' + err.message)
+    } finally {
+      setIsSendingReply(false)
+    }
+  }
 
   // Use refs to avoid resetting the simulation interval when rules change
   const automationEnabledRef = useRef(automationEnabled)
@@ -1789,10 +2317,36 @@ export default function App() {
   const handleCompleteTask = async (id: string) => {
     setCompletingIds((prev) => new Set(prev).add(id))
     try {
-      const taskRef = doc(db, 'tasks', id)
-      await updateDoc(taskRef, { status: 'completed' })
-    } catch (err) {
-      console.error('Error updating task status:', err)
+      const user = auth.currentUser
+      if (!user) throw new Error('Nem bejelentkezett felhasználó')
+      const token = await user.getIdToken()
+
+      const response = await fetch('https://archivetask-cdaanjspxq-uc.a.run.app', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ taskId: id }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Sikertelen feladat archiválás.')
+      }
+
+      // Trigger notification
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'Feladat archiválva',
+          taskSummary: 'A feladat átkerült a Kukába.',
+        },
+      ])
+    } catch (err: any) {
+      console.error('Error archiving task:', err)
+      alert('Hiba az archiválás során: ' + err.message)
     }
     setTimeout(() => {
       setCompletingIds((prev) => {
@@ -1801,6 +2355,41 @@ export default function App() {
         return next
       })
     }, 450)
+  }
+
+  const handleRestoreTask = async (id: string) => {
+    try {
+      const user = auth.currentUser
+      if (!user) throw new Error('Nem bejelentkezett felhasználó')
+      const token = await user.getIdToken()
+
+      const response = await fetch('https://restoretask-cdaanjspxq-uc.a.run.app', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ taskId: id }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Sikertelen feladat visszaállítás.')
+      }
+
+      // Trigger notification
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'Feladat visszaállítva',
+          taskSummary: 'A feladat sikeresen visszakerült az aktív táblára.',
+        },
+      ])
+    } catch (err: any) {
+      console.error('Error restoring task:', err)
+      alert('Hiba a visszaállítás során: ' + err.message)
+    }
   }
 
   const handleSaveAutomation = async (rules: string, enabled: boolean) => {
@@ -1834,6 +2423,40 @@ export default function App() {
           id: toastId,
           message: 'Mentési hiba',
           taskSummary: 'Nem sikerült elmenteni a beállításokat.',
+        },
+      ])
+    }
+  }
+
+  const handleToggleWhitelist = async (checked: boolean) => {
+    if (!userEmail) return
+    try {
+      const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
+      await setDoc(settingsRef, {
+        enforceWhitelist: checked
+      }, { merge: true })
+
+      setEnforceWhitelist(checked)
+
+      // Trigger notification
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'Fehérlista módosítva',
+          taskSummary: checked ? 'Szigorú fehérlista aktív' : 'Bárki küldhet e-mailt',
+        },
+      ])
+    } catch (err) {
+      console.error('Error updating enforceWhitelist:', err)
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'Mentési hiba',
+          taskSummary: 'Nem sikerült elmenteni a fehérlista beállítást.',
         },
       ])
     }
@@ -1875,9 +2498,12 @@ export default function App() {
           sender: data.sender || '',
           subject: data.subject || '',
           user_email: data.user_email || '',
-          status: data.status || 'pending',
+          status: data.status === 'pending' ? 'active' : (data.status || 'active'),
           ai_reply: data.ai_reply || null,
           ai_status: data.ai_status || 'idle',
+          ai_summary: data.ai_summary || '',
+          textContent: data.textContent || '',
+          archivedAt: data.archivedAt ? (typeof data.archivedAt.toDate === 'function' ? data.archivedAt.toDate().toISOString() : data.archivedAt) : null,
         } as Task
       })
 
@@ -1931,6 +2557,7 @@ export default function App() {
           if (data.promptRules) {
             setPromptRules(data.promptRules)
           }
+          setEnforceWhitelist(data.enforceWhitelist !== false)
         }
       } catch (err) {
         console.error('Error fetching auto-responder settings:', err)
@@ -1952,7 +2579,7 @@ export default function App() {
         />
       )}
 
-      {view !== 'login' && userEmail && hasAccess && (
+       {view !== 'login' && userEmail && hasAccess && (
         <MainDashboard
           userEmail={userEmail}
           tasks={tasks}
@@ -1969,6 +2596,10 @@ export default function App() {
           onOpenFeedback={() => setIsFeedbackOpen(true)}
           processedEmailsThisMonth={processedEmailsThisMonth}
           tier={tier}
+          enforceWhitelist={enforceWhitelist}
+          onToggleWhitelist={handleToggleWhitelist}
+          onWriteReply={handleWriteReply}
+          onRestoreTask={handleRestoreTask}
         />
       )}
 
@@ -1979,6 +2610,112 @@ export default function App() {
         onSubmit={handleSubmitFeedback}
         userEmail={userEmail || DEMO_USER_EMAIL}
       />
+
+      {/* Manual Reply Modal */}
+      {replyTask && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-2xl overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/90 shadow-2xl backdrop-blur-md transition-all duration-300">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
+              <div className="flex items-center gap-2">
+                <Mail className="h-5 w-5 text-indigo-400" />
+                <h3 className="text-base font-bold text-white">Manuális válasz küldése</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReplyTask(null)}
+                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="space-y-4 p-6">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">Címzett</label>
+                <input
+                  type="email"
+                  value={replyRecipient}
+                  onChange={(e) => setReplyRecipient(e.target.value)}
+                  className="mt-1.5 w-full rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-sm text-slate-200 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  placeholder="ugyfel@ceg.hu"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">Tárgy</label>
+                <input
+                  type="text"
+                  value={replySubject}
+                  onChange={(e) => setReplySubject(e.target.value)}
+                  className="mt-1.5 w-full rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-sm text-slate-200 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  placeholder="Válasz"
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">Válaszüzenet</label>
+                  
+                  <button
+                    type="button"
+                    onClick={handleImproveDraft}
+                    disabled={isImprovingDraft || !replyBody.trim()}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 font-semibold text-xs px-2.5 py-1.5 shadow transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none"
+                  >
+                    {isImprovingDraft ? (
+                      <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent" />
+                    ) : (
+                      <Sparkles className="h-3.5 w-3.5 text-indigo-400 animate-pulse" />
+                    )}
+                    <span>AI Válasz Feljavítása</span>
+                  </button>
+                </div>
+                
+                <textarea
+                  value={replyBody}
+                  onChange={(e) => setReplyBody(e.target.value)}
+                  rows={8}
+                  className="w-full rounded-xl border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-200 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none leading-relaxed"
+                  placeholder="Írja ide a válaszát..."
+                />
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="flex items-center justify-end gap-3 border-t border-slate-800 px-6 py-4 bg-slate-950/40">
+              <button
+                type="button"
+                onClick={() => setReplyTask(null)}
+                disabled={isSendingReply}
+                className="rounded-xl border border-slate-800 bg-slate-900/60 hover:bg-slate-800 px-5 py-2.5 text-xs font-semibold text-slate-300 transition-all active:scale-95 disabled:opacity-50"
+              >
+                Mégse
+              </button>
+              
+              <button
+                type="button"
+                onClick={handleSendManualReply}
+                disabled={isSendingReply || !replyBody.trim() || !replyRecipient.trim() || !replySubject.trim()}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs px-5 py-2.5 shadow-lg transition-all active:scale-95 disabled:opacity-50"
+              >
+                {isSendingReply ? (
+                  <>
+                    <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                    <span>Küldés folyamatban…</span>
+                  </>
+                ) : (
+                  <>
+                    <Check className="h-4 w-4" />
+                    <span>Küldés</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Toast Stack */}
       {toasts.length > 0 && (

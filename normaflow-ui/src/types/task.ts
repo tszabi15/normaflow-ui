@@ -5,7 +5,7 @@ export type TaskCategory =
   | 'Ügyfél kérdés'
   | 'E-mail'
 
-export type TaskStatus = 'pending' | 'completed'
+export type TaskStatus = 'active' | 'archived' | 'completed'
 
 export type TaskPriority = 1 | 2 | 3 | 4 | 5
 
@@ -21,5 +21,8 @@ export interface Task {
   user_email: string
   status: TaskStatus
   ai_reply?: string
-  ai_status?: 'idle' | 'generating' | 'sent'
+  ai_status?: 'idle' | 'generating' | 'sent' | 'pending_review'
+  ai_summary?: string
+  textContent?: string
+  archivedAt?: any
 }

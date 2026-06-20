@@ -181,43 +181,61 @@ export const handleIncomingEmail = onRequest({
       return;
     }
 
-    // Whitelist Enforcement
-    const senderEmail = extractEmail(sender);
-    const clientsSnap = await db.collection("users")
-      .doc(targetEmail)
-      .collection("clients")
-      .where("email", "==", senderEmail)
-      .get();
-
-    if (clientsSnap.empty) {
-      logger.info(`Whitelisting: Sender ${senderEmail} is not a registered client of ${targetEmail}. Skipping processing.`);
-      res.status(200).json({ status: "skipped", message: "Sender is not whitelisted in accountant's clients." });
-      return;
-    }
-
-
-    // Step B: Fetch Accountant's Custom Rules
+    // Step B: Fetch Accountant's Custom Rules / settings
     logger.info(`Fetching auto-responder settings for userEmail: ${targetEmail}`);
     const autoResponderRef = db.doc(`users/${targetEmail}/settings/auto_responder`);
     const rulesDoc = await autoResponderRef.get();
 
     let automationEnabled = false;
     let promptRules = "";
+    let enforceWhitelist = true; // default to true if not set
 
     if (rulesDoc.exists) {
       const data = rulesDoc.data();
       automationEnabled = !!data?.automationEnabled;
       promptRules = data?.promptRules || "";
+      if (data?.enforceWhitelist === false) {
+        enforceWhitelist = false;
+      }
+    }
+
+    // Whitelist Enforcement
+    if (enforceWhitelist) {
+      const senderEmail = extractEmail(sender);
+      const clientsSnap = await db.collection("users")
+        .doc(targetEmail)
+        .collection("clients")
+        .where("email", "==", senderEmail)
+        .get();
+
+      if (clientsSnap.empty) {
+        logger.info(`Whitelisting: Sender ${senderEmail} is not a registered client of ${targetEmail}. Skipping processing.`);
+        res.status(200).json({ status: "skipped", message: "Sender is not whitelisted in accountant's clients." });
+        return;
+      }
+    } else {
+      logger.info(`Whitelisting bypass: enforceWhitelist is false. Processing email from ${sender}.`);
     }
 
     let aiReply: string | null = null;
+    let aiSummary = "Nem sikerült összefoglalót készíteni.";
 
     // Step C: Cost-Optimized AI Engine
-    if (automationEnabled && promptRules.trim()) {
+    if (process.env.OPENAI_API_KEY) {
       logger.info(`Triggering OpenAI gpt-4o-mini for userEmail: ${targetEmail}`);
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       
-      const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy a beérkező e-mailre generálj egy hivatalos, udvarias választervezetet a könyvelő által meghatározott egyedi szabályok alapján.\n\nKönyvelő egyedi szabályai:\n${promptRules}`;
+      const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy elemezd a beérkező e-mailt.
+Készíts egy rövid, 1-2 mondatos magyar nyelvű összefoglalót és szükség esetén teendőket (actionable bullet points) a könyvelő számára.
+
+${automationEnabled && promptRules.trim() ? `Ezen kívül a könyvelő által meghatározott egyedi szabályok alapján készíts egy hivatalos, udvarias választervezet-javaslatot is.
+Könyvelő egyedi szabályai:
+${promptRules}` : ''}
+
+A választ szigorúan JSON formátumban add vissza, az alábbi kulcsokkal:
+- "summary": A beérkező e-mail 1-2 mondatos magyar nyelvű összefoglalója, alatta új sorban a teendők listájával (pl. "Összegzés: ... \\nTeendők:\\n- ...").
+- "reply": A szabályok alapján generált választervezet szövege, vagy null, ha az automatikus választervezés nincs engedélyezve/nem alkalmazható.`;
+
       const userPrompt = `Feladó: ${sender}\nTárgy: ${subject || "Nincs tárgy megadva"}\nÜzenet:\n${textContent}`;
 
       const response = await openai.chat.completions.create({
@@ -226,16 +244,23 @@ export const handleIncomingEmail = onRequest({
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt }
         ],
-        max_tokens: 400,
+        response_format: { type: "json_object" },
+        max_tokens: 600,
       });
 
-      aiReply = response.choices[0]?.message?.content || null;
+      try {
+        const result = JSON.parse(response.choices[0]?.message?.content || "{}");
+        aiSummary = result.summary || "Nem sikerült összefoglalót készíteni.";
+        aiReply = result.reply || null;
+      } catch (parseErr) {
+        logger.error("Error parsing JSON response from OpenAI:", parseErr);
+      }
     } else {
-      logger.info(`AI automation disabled or prompt rules missing/empty for userEmail: ${targetEmail}`);
+      logger.warn("OpenAI API key missing in handleIncomingEmail");
     }
 
     // Step D: Structured Firestore Ingestion
-    const aiStatus = aiReply ? "sent" : "idle";
+    const aiStatus = "pending_review";
     const nextStep = aiReply ? "AI választervezet felülvizsgálata" : "Manuális válasz írása szükséges";
 
     const taskPayload = {
@@ -247,9 +272,12 @@ export const handleIncomingEmail = onRequest({
       sender,
       subject: subject || "",
       user_email: targetEmail, // map to targetEmail
-      status: "pending",
+      status: "active",
+      archivedAt: null,
       ai_status: aiStatus,
       ai_reply: aiReply,
+      ai_summary: aiSummary,
+      textContent: textContent,
     };
 
     logger.info("Saving new task to Firestore...");
@@ -424,10 +452,14 @@ async function performEmailSync(targetEmail: string): Promise<number> {
   const rulesDoc = await db.doc(`users/${targetEmail}/settings/auto_responder`).get();
   let automationEnabled = false;
   let promptRules = "";
+  let enforceWhitelist = true;
   if (rulesDoc.exists) {
     const data = rulesDoc.data();
     automationEnabled = !!data?.automationEnabled;
     promptRules = data?.promptRules || "";
+    if (data?.enforceWhitelist === false) {
+      enforceWhitelist = false;
+    }
   }
 
 
@@ -465,14 +497,22 @@ async function performEmailSync(targetEmail: string): Promise<number> {
         }
 
         // Whitelist check
-        const senderEmail = extractEmail(sender);
-        const clientsSnap = await db.collection("users")
-          .doc(targetEmail)
-          .collection("clients")
-          .where("email", "==", senderEmail)
-          .get();
+        let isWhitelisted = true;
+        if (enforceWhitelist) {
+          const senderEmail = extractEmail(sender);
+          const clientsSnap = await db.collection("users")
+            .doc(targetEmail)
+            .collection("clients")
+            .where("email", "==", senderEmail)
+            .get();
 
-        if (clientsSnap.empty) {
+          if (clientsSnap.empty) {
+            isWhitelisted = false;
+          }
+        }
+
+        if (!isWhitelisted) {
+          const senderEmail = extractEmail(sender);
           logger.info(`performEmailSync: Whitelist check failed for sender ${senderEmail}. Skipping.`);
           if (msg.uid) {
             await client.messageFlagsAdd({ uid: msg.uid }, ["\\Seen"], { uid: true });
@@ -509,10 +549,21 @@ async function performEmailSync(targetEmail: string): Promise<number> {
 
         // AI Engine
         let aiReply: string | null = null;
-        if (automationEnabled && promptRules.trim() && process.env.OPENAI_API_KEY) {
+        let aiSummary = "Nem sikerült összefoglalót készíteni.";
+        if (process.env.OPENAI_API_KEY) {
           try {
             const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-            const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy a beérkező e-mailre generálj egy hivatalos, udvarias választervezetet a könyvelő által meghatározott egyedi szabályok alapján.\n\nKönyvelő egyedi szabályai:\n${promptRules}`;
+            const systemPrompt = `Te a NormaFlow AI asszisztense vagy egy könyvelőirodában. A feladatod, hogy elemezd a beérkező e-mailt.
+Készíts egy rövid, 1-2 mondatos magyar nyelvű összefoglalót és szükség esetén teendőket (actionable bullet points) a könyvelő számára.
+
+${automationEnabled && promptRules.trim() ? `Ezen kívül a könyvelő által meghatározott egyedi szabályok alapján készíts egy hivatalos, udvarias választervezet-javaslatot is.
+Könyvelő egyedi szabályai:
+${promptRules}` : ''}
+
+A választ szigorúan JSON formátumban add vissza, az alábbi kulcsokkal:
+- "summary": A beérkező e-mail 1-2 mondatos magyar nyelvű összefoglalója, alatta új sorban a teendők listájával (pl. "Összegzés: ... \\nTeendők:\\n- ...").
+- "reply": A szabályok alapján generált választervezet szövege, vagy null, ha az automatikus választervezés nincs engedélyezve/nem alkalmazható.`;
+
             const userPrompt = `Feladó: ${sender}\nTárgy: ${subject || "Nincs tárgy megadva"}\nÜzenet:\n${textContent.substring(0, 2000)}`;
 
             const response = await openai.chat.completions.create({
@@ -521,16 +572,19 @@ async function performEmailSync(targetEmail: string): Promise<number> {
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userPrompt },
               ],
-              max_tokens: 400,
+              response_format: { type: "json_object" },
+              max_tokens: 600,
             });
-            aiReply = response.choices[0]?.message?.content || null;
+            const result = JSON.parse(response.choices[0]?.message?.content || "{}");
+            aiSummary = result.summary || "Nem sikerült összefoglalót készíteni.";
+            aiReply = result.reply || null;
           } catch (aiErr) {
             logger.error(`syncEmails: AI error for ${targetEmail}:`, aiErr);
           }
         }
 
         // Push task to Firestore
-        const aiStatus = aiReply ? "sent" : "idle";
+        const aiStatus = "pending_review";
         const nextStep = aiReply ? "AI választervezet felülvizsgálata" : "Manuális válasz írása szükséges";
 
         await db.collection("tasks").add({
@@ -542,9 +596,12 @@ async function performEmailSync(targetEmail: string): Promise<number> {
           sender,
           subject: subject || "",
           user_email: targetEmail,
-          status: "pending",
+          status: "active",
+          archivedAt: null,
           ai_status: aiStatus,
           ai_reply: aiReply,
+          ai_summary: aiSummary,
+          textContent: textContent,
           source_provider: config.provider,
         });
 
@@ -763,5 +820,289 @@ export const sendAiReply = onRequest({
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error("sendAiReply error:", errorMessage);
     res.status(500).json({ error: "Internal Server Error", message: errorMessage });
+  }
+});
+
+/**
+ * SUBSYSTEM 5: sendManualEmail
+ * Authenticated POST endpoint to compose and send manual SMTP replies.
+ */
+export const sendManualEmail = onRequest({
+  cors: true,
+  maxInstances: 10,
+  invoker: "public",
+}, async (req, res) => {
+  try {
+    if (req.method === 'OPTIONS') {
+      res.set('Access-Control-Allow-Origin', '*');
+      res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.status(204).send('');
+      return;
+    }
+
+    const authResult = await verifyAuthToken(req);
+    if (!authResult) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const userEmail = authResult.email;
+    const isSubscribed = await checkSubscription(userEmail);
+    if (!isSubscribed) {
+      res.status(403).json({ error: "Forbidden: Active subscription required" });
+      return;
+    }
+
+    const { taskId, recipient, subject, body } = req.body as {
+      taskId: string;
+      recipient: string;
+      subject: string;
+      body: string;
+    };
+
+    if (!taskId || !recipient || !subject || !body) {
+      res.status(400).json({ error: "Missing required fields: taskId, recipient, subject, body" });
+      return;
+    }
+
+    // Load accountant SMTP config
+    const configDoc = await db.doc(`users/${userEmail}/tokens/email_config`).get();
+    if (!configDoc.exists) {
+      res.status(400).json({ error: "Email configuration missing. Please connect your email first." });
+      return;
+    }
+    const config = configDoc.data() as EmailConfig;
+    const servers = resolveEmailServers(config);
+
+    // Setup nodemailer
+    const transporter = nodemailer.createTransport({
+      host: servers.smtpHost,
+      port: servers.smtpPort,
+      secure: servers.smtpPort === 465,
+      auth: {
+        user: config.email,
+        pass: config.password,
+      },
+    });
+
+    await transporter.sendMail({
+      from: `"${userEmail}" <${config.email}>`,
+      to: recipient,
+      subject: subject,
+      text: body,
+    });
+
+    // Update task status in Firestore to completed
+    await db.collection("tasks").doc(taskId).update({
+      status: "completed",
+      ai_status: "sent",
+      ai_reply: body,
+      replied_at: new Date().toISOString(),
+    });
+
+    res.status(200).json({ status: "success", message: "Email sent manually and task updated." });
+  } catch (err: any) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("Error in sendManualEmail:", errMsg);
+    res.status(500).json({ error: "Internal Server Error", message: errMsg });
+  }
+});
+
+/**
+ * SUBSYSTEM 6: improveEmailDraft
+ * Authenticated POST endpoint to professionalize draft content using AI.
+ */
+export const improveEmailDraft = onRequest({
+  cors: true,
+  maxInstances: 10,
+  invoker: "public",
+  secrets: ["OPENAI_API_KEY"],
+}, async (req, res) => {
+  try {
+    if (req.method === 'OPTIONS') {
+      res.set('Access-Control-Allow-Origin', '*');
+      res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.status(204).send('');
+      return;
+    }
+
+    const authResult = await verifyAuthToken(req);
+    if (!authResult) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const userEmail = authResult.email;
+    const isSubscribed = await checkSubscription(userEmail);
+    if (!isSubscribed) {
+      res.status(403).json({ error: "Forbidden: Active subscription required" });
+      return;
+    }
+
+    const { text } = req.body as { text: string };
+    if (!text || !text.trim()) {
+      res.status(400).json({ error: "Missing required field: text" });
+      return;
+    }
+
+    if (!process.env.OPENAI_API_KEY) {
+      res.status(500).json({ error: "OpenAI API key not configured" });
+      return;
+    }
+
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: "You are an expert business assistant. Refine, professionalize, and fix grammatical mistakes for the following Hungarian email draft. Keep the format clean and polite. Return ONLY the enhanced message text.",
+        },
+        { role: "user", content: text },
+      ],
+      max_tokens: 600,
+    });
+
+    const enhancedText = response.choices[0]?.message?.content?.trim() || text;
+    res.status(200).json({ status: "success", text: enhancedText });
+  } catch (err: any) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("Error in improveEmailDraft:", errMsg);
+    res.status(500).json({ error: "Internal Server Error", message: errMsg });
+  }
+});
+
+/**
+ * Automated Daily Task Cleanup Cron Job
+ * Runs daily at midnight.
+ * Deletes tasks in status "archived" where archivedAt is older than 30 days.
+ */
+export const cleanupExpiredTasks = onSchedule({ schedule: "0 0 * * *" }, async (event) => {
+  logger.info("Starting cleanupExpiredTasks job...");
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+  try {
+    const expiredTasksQuery = await db.collection("tasks")
+      .where("status", "==", "archived")
+      .where("archivedAt", "<", thirtyDaysAgo)
+      .get();
+
+    if (expiredTasksQuery.empty) {
+      logger.info("No expired archived tasks found to delete.");
+      return;
+    }
+
+    const batch = db.batch();
+    expiredTasksQuery.docs.forEach((doc) => {
+      logger.info(`Adding task ID ${doc.id} to deletion batch.`);
+      batch.delete(doc.ref);
+    });
+
+    await batch.commit();
+    logger.info(`Successfully deleted ${expiredTasksQuery.size} expired archived tasks.`);
+  } catch (err: any) {
+    logger.error("Error in cleanupExpiredTasks:", err);
+  }
+});
+
+/**
+ * Archive Task (Soft Delete)
+ * Marks a task as status: "archived" and sets archivedAt timestamp.
+ */
+export const archiveTask = onRequest({ cors: true }, async (req, res) => {
+  try {
+    const verifiedUser = await verifyAuthToken(req);
+    if (!verifiedUser) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const isSubscribed = await checkSubscription(verifiedUser.email);
+    if (!isSubscribed) {
+      res.status(403).json({ error: "Forbidden: Active subscription required" });
+      return;
+    }
+
+    const { taskId } = req.body as { taskId: string };
+    if (!taskId) {
+      res.status(400).json({ error: "Missing required field: taskId" });
+      return;
+    }
+
+    const taskRef = db.collection("tasks").doc(taskId);
+    const taskDoc = await taskRef.get();
+    if (!taskDoc.exists) {
+      res.status(404).json({ error: "Task not found" });
+      return;
+    }
+
+    if (taskDoc.data()?.user_email !== verifiedUser.email) {
+      res.status(403).json({ error: "Forbidden: You do not own this task" });
+      return;
+    }
+
+    await taskRef.update({
+      status: "archived",
+      archivedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.status(200).json({ status: "success", taskId });
+  } catch (err: any) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("Error in archiveTask:", errMsg);
+    res.status(500).json({ error: "Internal Server Error", message: errMsg });
+  }
+});
+
+/**
+ * Restore Task (Undo Soft Delete)
+ * Sets task status to "active", clears archivedAt, and resets ai_status to "pending_review".
+ */
+export const restoreTask = onRequest({ cors: true }, async (req, res) => {
+  try {
+    const verifiedUser = await verifyAuthToken(req);
+    if (!verifiedUser) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const isSubscribed = await checkSubscription(verifiedUser.email);
+    if (!isSubscribed) {
+      res.status(403).json({ error: "Forbidden: Active subscription required" });
+      return;
+    }
+
+    const { taskId } = req.body as { taskId: string };
+    if (!taskId) {
+      res.status(400).json({ error: "Missing required field: taskId" });
+      return;
+    }
+
+    const taskRef = db.collection("tasks").doc(taskId);
+    const taskDoc = await taskRef.get();
+    if (!taskDoc.exists) {
+      res.status(404).json({ error: "Task not found" });
+      return;
+    }
+
+    if (taskDoc.data()?.user_email !== verifiedUser.email) {
+      res.status(403).json({ error: "Forbidden: You do not own this task" });
+      return;
+    }
+
+    await taskRef.update({
+      status: "active",
+      archivedAt: null,
+      ai_status: "pending_review",
+    });
+
+    res.status(200).json({ status: "success", taskId });
+  } catch (err: any) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("Error in restoreTask:", errMsg);
+    res.status(500).json({ error: "Internal Server Error", message: errMsg });
   }
 });
