@@ -20,6 +20,8 @@ import {
 import type { Task, TaskCategory, TaskPriority } from './types/task'
 import AutoResponder from './components/dashboard/AutoResponder'
 import FeedbackModal from './components/dashboard/FeedbackModal'
+import { db } from './firebase'
+import { collection, query, where, onSnapshot, doc, updateDoc, setDoc, getDoc } from 'firebase/firestore'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -36,13 +38,13 @@ interface Toast {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const DEMO_USER_EMAIL = 'kovacs.kata@normaflow.hu'
-const STREAM_INTERVAL_MS = 15_000
 
 const CATEGORIES: TaskCategory[] = [
   'NAV / Hivatalos',
   'Sürgős teendő',
   'Számla / Bizonylat',
   'Ügyfél kérdés',
+  'E-mail',
 ]
 
 const CATEGORY_FILTERS: CategoryFilter[] = ['Összes', ...CATEGORIES]
@@ -74,175 +76,8 @@ function formatTimestamp(iso: string): string {
   })
 }
 
-function hoursAgo(hours: number): string {
-  return new Date(Date.now() - hours * 3_600_000).toISOString()
-}
-
-function minutesAgo(minutes: number): string {
-  return new Date(Date.now() - minutes * 60_000).toISOString()
-}
 
 // ─── Mock Database ───────────────────────────────────────────────────────────
-
-const INITIAL_TASKS: Task[] = [
-  {
-    id: 'task-001',
-    category: 'NAV / Hivatalos',
-    summary: 'NAV Azonnali Inkasszó veszély — TrendMarket Kft.',
-    next_step:
-      'Azonnal ellenőrizd a NAV Ügyfélportálon az inkasszó értesítést, és értesítsd a TrendMarket Kft. ügyvezetőjét a számlaszám egyenlegéről.',
-    priority: 5,
-    received_at: minutesAgo(12),
-    sender: 'ertesites@nav.gov.hu',
-    subject: 'Azonnali inkasszó értesítés — TrendMarket Kft. (12345678-2-41)',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-  {
-    id: 'task-002',
-    category: 'Sürgős teendő',
-    summary: 'Bérszámfejtési adatok hiánya — Kovács és Társa Bt.',
-    next_step:
-      'Küldj emlékeztetőt a Kovács és Társa Bt. HR osztályának a hiányzó jelenléti ívek és túlórák adatairól — határidő: holnap 12:00.',
-    priority: 4,
-    received_at: hoursAgo(2),
-    sender: 'hr@kovacs-tarsa.hu',
-    subject: 'RE: Márciusi bérszámfejtés — hiányzó adatok',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-  {
-    id: 'task-003',
-    category: 'Számla / Bizonylat',
-    summary: 'Külföldi számlák áfa köre — Apex Digital Kft.',
-    next_step:
-      'Ellenőrizd az Apex Digital Kft. német és osztrák beszállítói számláinak áfa-kezelését, és készítsd elő a 58-as bevallás módosítását.',
-    priority: 3,
-    received_at: hoursAgo(5),
-    sender: 'penzugy@apexdigital.hu',
-    subject: 'Külföldi számlák — áfa kör tisztázása szükséges',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-  {
-    id: 'task-004',
-    category: 'NAV / Hivatalos',
-    summary: 'NAV ellenőrzési értesítés — SolarTech Zrt.',
-    next_step:
-      'Készítsd össze a SolarTech Zrt. 2023-as évi bizonylatait és főkönyvi kivonatokat — NAV ellenőrzés indul 8 napon belül.',
-    priority: 5,
-    received_at: hoursAgo(1),
-    sender: 'ellenorzes@nav.gov.hu',
-    subject: 'Adóellenőrzési értesítés — SolarTech Zrt. (98765432-1-13)',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-  {
-    id: 'task-005',
-    category: 'Ügyfél kérdés',
-    summary: 'OEP járulék kérdés — Horváth Nikolett E.V.',
-    next_step:
-      'Válaszolj Horváth Nikolett E.V.-nek az egészségügyi járulék 2024-es mértékéről és a kötelező bevallási határidőkről.',
-    priority: 2,
-    received_at: hoursAgo(8),
-    sender: 'horvath.nikolett@gmail.com',
-    subject: 'Kérdés: TB járulék mértéke egyéni vállalkozónál',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-  {
-    id: 'task-006',
-    category: 'Számla / Bizonylat',
-    summary: 'Lejárt szállítói számla — BuildPro Kft.',
-    next_step:
-      'Egyeztess a BuildPro Kft. pénzügyi vezetőjével a 3 lejárt szállítói számla (összesen 2,4 M Ft) rendezési ütemezéséről.',
-    priority: 4,
-    received_at: hoursAgo(3),
-    sender: 'szamla@buildpro.hu',
-    subject: 'FIZETÉSI FELSZÓLÍTÁS — 3 db lejárt számla',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-  {
-    id: 'task-007',
-    category: 'Ügyfél kérdés',
-    summary: 'EVÁ bevallás határideje — MiniShop Bt.',
-    next_step:
-      'Tájékoztasd a MiniShop Bt. ügyvezetőjét az EVÁ bevallás következő határidejéről és a szükséges dokumentumokról.',
-    priority: 1,
-    received_at: hoursAgo(26),
-    sender: 'info@minishop.hu',
-    subject: 'Kérdés: EVÁ bevallás — mikor kell benyújtani?',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-  {
-    id: 'task-008',
-    category: 'NAV / Hivatalos',
-    summary: 'Hiányzó NAV bevallás — FreshFood Kft.',
-    next_step:
-      'Azonnal indítsd el a FreshFood Kft. 2508-as áfabevallásának pótlását — 3 napja lejárt a határidő, mulasztási bírság veszély.',
-    priority: 3,
-    received_at: hoursAgo(6),
-    sender: 'ertesites@nav.gov.hu',
-    subject: 'Hiányzó bevallás figyelmeztetés — FreshFood Kft.',
-    user_email: DEMO_USER_EMAIL,
-    status: 'pending',
-  },
-]
-
-const STREAM_TASK_TEMPLATES: Omit<Task, 'id' | 'received_at' | 'status'>[] = [
-  {
-    category: 'Sürgős teendő',
-    summary: 'Új bankszámla kivonat — GreenEnergy Kft.',
-    next_step:
-      'Importáld a GreenEnergy Kft. friss bankszámla kivonatát és párosítsd a nyitott tételeket.',
-    priority: 3,
-    sender: 'penzugy@greenenergy.hu',
-    subject: 'Márciusi bankszámla kivonat csatolva',
-    user_email: DEMO_USER_EMAIL,
-  },
-  {
-    category: 'Ügyfél kérdés',
-    summary: 'KATA kilépés kérdés — Szabó Péter E.V.',
-    next_step:
-      'Készíts részletes tájékoztatót Szabó Péter E.V.-nek a KATA kilépés feltételeiről és következményeiről.',
-    priority: 2,
-    sender: 'szabo.peter.ev@gmail.com',
-    subject: 'KATA — kilépés lehetősége és határidők',
-    user_email: DEMO_USER_EMAIL,
-  },
-  {
-    category: 'NAV / Hivatalos',
-    summary: 'NAV felszólítás — MetroLogisztika Kft.',
-    next_step:
-      'Ellenőrizd a MetroLogisztika Kft. NAV felszólítását és készítsd elő a válaszlevelet 48 órán belül.',
-    priority: 5,
-    sender: 'ertesites@nav.gov.hu',
-    subject: 'Felszólítás — elmaradt járulékbevallás',
-    user_email: DEMO_USER_EMAIL,
-  },
-  {
-    category: 'Számla / Bizonylat',
-    summary: 'Hibás számla javítás — TechVision Zrt.',
-    next_step:
-      'Kérd meg a TechVision Zrt.-t a hibás áfa tartalmú számla (TV-2024/0892) sztornózására és helyesbítő kiállítására.',
-    priority: 4,
-    sender: 'szamla@techvision.hu',
-    subject: 'Hibás számla — áfa összeg eltérés',
-    user_email: DEMO_USER_EMAIL,
-  },
-  {
-    category: 'Sürgős teendő',
-    summary: 'Éves beszámoló határidő — ArtDesign Studio Kft.',
-    next_step:
-      'Indítsd el az ArtDesign Studio Kft. 2024-es éves beszámolójának összeállítását — határidő: 30 nap.',
-    priority: 4,
-    sender: 'ugyvezeto@artdesign.hu',
-    subject: 'Éves beszámoló — mikor készül el?',
-    user_email: DEMO_USER_EMAIL,
-  },
-]
 
 // ─── Priority Styling ────────────────────────────────────────────────────────
 
@@ -739,6 +574,7 @@ function MainDashboard({
       'Sürgős teendő': 0,
       'Számla / Bizonylat': 0,
       'Ügyfél kérdés': 0,
+      'E-mail': 0,
     }
     for (const t of pendingForUser) {
       counts[t.category]++
@@ -1034,7 +870,7 @@ export default function App() {
   const [userEmail, setUserEmail] = useState<string | null>(null)
   const [isSubscribed, setIsSubscribed] = useState(false)
   const [devBypass, setDevBypass] = useState(false)
-  const [tasks, setTasks] = useState<Task[]>(INITIAL_TASKS)
+  const [tasks, setTasks] = useState<Task[]>([])
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('Összes')
   const [completingIds, setCompletingIds] = useState<Set<string>>(new Set())
   const [toasts, setToasts] = useState<Toast[]>([])
@@ -1092,12 +928,15 @@ export default function App() {
     setView('dashboard')
   }
 
-  const handleCompleteTask = (id: string) => {
+  const handleCompleteTask = async (id: string) => {
     setCompletingIds((prev) => new Set(prev).add(id))
+    try {
+      const taskRef = doc(db, 'tasks', id)
+      await updateDoc(taskRef, { status: 'completed' })
+    } catch (err) {
+      console.error('Error updating task status:', err)
+    }
     setTimeout(() => {
-      setTasks((prev) =>
-        prev.map((t) => (t.id === id ? { ...t, status: 'completed' as const } : t)),
-      )
       setCompletingIds((prev) => {
         const next = new Set(prev)
         next.delete(id)
@@ -1106,20 +945,40 @@ export default function App() {
     }, 450)
   }
 
-  const handleSaveAutomation = (rules: string, enabled: boolean) => {
-    setPromptRules(rules)
-    setAutomationEnabled(enabled)
-    
-    // Trigger notification
-    const toastId = generateId()
-    setToasts((prev) => [
-      ...prev,
-      {
-        id: toastId,
-        message: 'Beállítások mentve',
-        taskSummary: enabled ? 'AI Auto-Responder aktív' : 'AI Auto-Responder inaktív',
-      },
-    ])
+  const handleSaveAutomation = async (rules: string, enabled: boolean) => {
+    if (!userEmail) return
+    try {
+      const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
+      await setDoc(settingsRef, {
+        automationEnabled: enabled,
+        promptRules: rules
+      }, { merge: true })
+
+      setPromptRules(rules)
+      setAutomationEnabled(enabled)
+      
+      // Trigger notification
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'Beállítások mentve',
+          taskSummary: enabled ? 'AI Auto-Responder aktív' : 'AI Auto-Responder inaktív',
+        },
+      ])
+    } catch (err) {
+      console.error('Error saving automation settings:', err)
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'Mentési hiba',
+          taskSummary: 'Nem sikerült elmenteni a beállításokat.',
+        },
+      ])
+    }
   }
 
   const handleSubmitFeedback = (title: string, category: string, description: string) => {
@@ -1136,73 +995,91 @@ export default function App() {
     ])
   }
 
-  // Real-time stream simulation
+  // Real-time Firestore tasks subscription
   useEffect(() => {
     if (view !== 'dashboard' || !userEmail) return
 
-    let streamIndex = 0
+    const q = query(
+      collection(db, 'tasks'),
+      where('user_email', '==', userEmail)
+    )
 
-    const interval = setInterval(() => {
-      const template =
-        STREAM_TASK_TEMPLATES[streamIndex % STREAM_TASK_TEMPLATES.length]
-      streamIndex++
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const loadedTasks = snapshot.docs.map((doc) => {
+        const data = doc.data()
+        return {
+          id: doc.id,
+          category: data.category || 'E-mail',
+          summary: data.summary || '',
+          next_step: data.next_step || '',
+          priority: data.priority || 3,
+          received_at: data.received_at || new Date().toISOString(),
+          sender: data.sender || '',
+          subject: data.subject || '',
+          user_email: data.user_email || '',
+          status: data.status || 'pending',
+          ai_reply: data.ai_reply || null,
+          ai_status: data.ai_status || 'idle',
+        } as Task
+      })
 
-      const isAutoOn = automationEnabledRef.current
-      const newTaskId = generateId()
+      // Trigger a toast notification when a new task is added in Firestore
+      setTasks((prev) => {
+        if (prev.length > 0 && loadedTasks.length > prev.length) {
+          const prevIds = new Set(prev.map((t) => t.id))
+          const newTasks = loadedTasks.filter((t) => !prevIds.has(t.id))
+          newTasks.forEach((newTask) => {
+            const toastId = generateId()
+            setToasts((toastPrev) => [
+              ...toastPrev,
+              {
+                id: toastId,
+                message: 'Új feladat érkezett',
+                taskSummary: newTask.summary,
+              },
+            ])
+            if (newTask.ai_status === 'sent' && newTask.ai_reply) {
+              setToasts((toastPrev) => [
+                ...toastPrev,
+                {
+                  id: generateId(),
+                  message: 'AI Válasz elküldve',
+                  taskSummary: `Címzett: ${newTask.sender}`,
+                },
+              ])
+            }
+          })
+        }
+        return loadedTasks
+      })
+    }, (error) => {
+      console.error('Firestore tasks subscription error:', error)
+    })
 
-      const newTask: Task = {
-        ...template,
-        id: newTaskId,
-        received_at: new Date().toISOString(),
-        status: 'pending',
-        user_email: userEmail,
-        ai_status: isAutoOn ? 'generating' : 'idle',
+    return () => unsubscribe()
+  }, [view, userEmail])
+
+  // Load auto-responder settings from Firestore on mount/login
+  useEffect(() => {
+    if (view !== 'dashboard' || !userEmail) return
+
+    const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
+    const fetchSettings = async () => {
+      try {
+        const docSnap = await getDoc(settingsRef)
+        if (docSnap.exists()) {
+          const data = docSnap.data()
+          setAutomationEnabled(!!data.automationEnabled)
+          if (data.promptRules) {
+            setPromptRules(data.promptRules)
+          }
+        }
+      } catch (err) {
+        console.error('Error fetching auto-responder settings:', err)
       }
+    }
 
-      setTasks((prev) => [newTask, ...prev])
-
-      const toastId = generateId()
-      setToasts((prev) => [
-        ...prev,
-        {
-          id: toastId,
-          message: 'Új feladat érkezett',
-          taskSummary: newTask.summary,
-        },
-      ])
-
-      // If automation is on, simulate generating a response after 5 seconds
-      if (isAutoOn) {
-        setTimeout(() => {
-          setTasks((prev) =>
-            prev.map((t) => {
-              if (t.id !== newTaskId) return t
-              const senderName = template.sender.split('@')[0]
-              const senderCapitalized = senderName.charAt(0).toUpperCase() + senderName.slice(1)
-              const generatedReply = `Kedves ${senderCapitalized}!\n\nKöszönjük megkeresését. A(z) "${template.subject}" tárgyú e-mailjét megkaptuk.\n\nAz Ön által kért műveletet a megadott beállítások alapján feldolgozzuk:\n"${promptRulesRef.current}"\n\nAmennyiben további adatra van szükségünk, kollégánk keresni fogja.\n\nÜdvözlettel,\nNormaFlow AI`
-
-              return {
-                ...t,
-                ai_status: 'sent',
-                ai_reply: generatedReply,
-              }
-            }),
-          )
-
-          // Trigger AI Toast
-          setToasts((prev) => [
-            ...prev,
-            {
-              id: generateId(),
-              message: 'AI Válasz elküldve',
-              taskSummary: `Címzett: ${template.sender}`,
-            },
-          ])
-        }, 5000)
-      }
-    }, STREAM_INTERVAL_MS)
-
-    return () => clearInterval(interval)
+    fetchSettings()
   }, [view, userEmail])
 
   const hasAccess = isSubscribed || devBypass
@@ -1243,6 +1120,7 @@ export default function App() {
         isOpen={isFeedbackOpen}
         onClose={() => setIsFeedbackOpen(false)}
         onSubmit={handleSubmitFeedback}
+        userEmail={userEmail || ''}
       />
 
       {/* Toast Stack */}

@@ -5,6 +5,7 @@ interface FeedbackModalProps {
   isOpen: boolean
   onClose: () => void
   onSubmit: (title: string, category: string, description: string) => void
+  userEmail: string
 }
 
 type FeedbackCategory = 'Új funkció' | 'Hiba' | 'Dizájn javaslat'
@@ -13,6 +14,7 @@ export default function FeedbackModal({
   isOpen,
   onClose,
   onSubmit,
+  userEmail,
 }: FeedbackModalProps) {
   const [title, setTitle] = useState('')
   const [category, setCategory] = useState<FeedbackCategory>('Új funkció')
@@ -21,33 +23,51 @@ export default function FeedbackModal({
 
   if (!isOpen) return null
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!title.trim() || !description.trim()) return
 
     setIsSubmitting(true)
 
-    // Simulate short network delay
-    setTimeout(() => {
-      // Log feedback object
-      const feedbackData = {
-        title: title.trim(),
-        category,
-        description: description.trim(),
-        submittedAt: new Date().toISOString(),
+    try {
+      let mappedCategory = 'Feature'
+      if (category === 'Hiba') {
+        mappedCategory = 'Bug'
+      } else if (category === 'Dizájn javaslat') {
+        mappedCategory = 'Design'
       }
-      console.log('Feedback submitted:', feedbackData)
 
-      // Trigger success callback
-      onSubmit(feedbackData.title, feedbackData.category, feedbackData.description)
+      const response = await fetch('https://handlefeedbacksubmit-cdaanjspxq-uc.a.run.app', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          title: title.trim(),
+          category: mappedCategory,
+          description: description.trim(),
+          user_email: userEmail,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Feedback submission failed with status: ${response.status}`)
+      }
+
+      // Trigger success callback (triggers toast in parent)
+      onSubmit(title.trim(), category, description.trim())
 
       // Reset form fields
       setTitle('')
       setCategory('Új funkció')
       setDescription('')
-      setIsSubmitting(false)
       onClose()
-    }, 400)
+    } catch (error) {
+      console.error('Error submitting feedback:', error)
+      alert('Hiba történt a visszajelzés beküldése során. Kérjük, próbálja meg újra!')
+    } finally {
+      setIsSubmitting(false)
+    }
   }
 
   return (

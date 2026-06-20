@@ -3,6 +3,7 @@ export type TaskCategory =
   | 'Sürgős teendő'
   | 'Számla / Bizonylat'
   | 'Ügyfél kérdés'
+  | 'E-mail'
 
 export type TaskStatus = 'pending' | 'completed'
 
