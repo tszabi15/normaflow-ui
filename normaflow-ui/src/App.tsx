@@ -24,7 +24,7 @@ import type { Task, TaskCategory, TaskPriority } from './types/task'
 import AutoResponder from './components/dashboard/AutoResponder'
 import FeedbackModal from './components/dashboard/FeedbackModal'
 import { db, auth } from './firebase'
-import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc, runTransaction } from 'firebase/firestore'
+import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc } from 'firebase/firestore'
 import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
@@ -38,7 +38,7 @@ import {
 
 type CategoryFilter = TaskCategory | 'Összes'
 
-type SubscriptionTier = 'basic' | 'pro' | 'ultra'
+type SubscriptionTier = 'none' | 'basic' | 'pro' | 'ultra'
 
 interface Toast {
   id: string
@@ -49,6 +49,7 @@ interface Toast {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const TIER_LIMITS: Record<SubscriptionTier, number> = {
+  none: 0,
   basic: 500,
   pro: 1500,
   ultra: 5000,
@@ -209,7 +210,7 @@ async function ensureUserDocument(email: string): Promise<void> {
     await setDoc(userRef, {
       email,
       subscriptionStatus: 'none',
-      tier: 'basic',
+      tier: 'none',
       processedEmailsThisMonth: 0,
       createdAt: new Date().toISOString(),
     })
@@ -874,8 +875,26 @@ function MainDashboard({
   onWriteReply: (task: Task) => void
   onRestoreTask: (id: string) => void
 }) {
-  const limit = TIER_LIMITS[tier as SubscriptionTier] ?? TIER_LIMITS.basic
+  const limit = TIER_LIMITS[tier as SubscriptionTier] ?? TIER_LIMITS.none
   const tierLabel = tier.charAt(0).toUpperCase() + tier.slice(1)
+
+  let workspaceTitle = "Nincs aktív előfizetés"
+  let workspaceSubtitle = "Nincs aktív előfizetés"
+  let workspaceStatusLabel = "Nincs aktív előfizetés"
+
+  if (tier === 'basic') {
+    workspaceTitle = "NormaFlow Basic"
+    workspaceSubtitle = "Basic munkaterület"
+    workspaceStatusLabel = "NormaFlow Basic aktív"
+  } else if (tier === 'pro') {
+    workspaceTitle = "NormaFlow Pro"
+    workspaceSubtitle = "Pro munkaterület"
+    workspaceStatusLabel = "NormaFlow Pro aktív"
+  } else if (tier === 'ultra') {
+    workspaceTitle = "NormaFlow Ultra"
+    workspaceSubtitle = "Ultra munkaterület"
+    workspaceStatusLabel = "NormaFlow Ultra aktív"
+  }
 
   const [taskStatusFilter, setTaskStatusFilter] = useState<'active' | 'archived'>('active')
   const [searchQuery, setSearchQuery] = useState('')
@@ -944,8 +963,8 @@ function MainDashboard({
               <Zap className="h-4 w-4 text-white" />
             </div>
             <div>
-              <p className="text-sm font-bold text-white">NormaFlow</p>
-              <p className="text-[10px] text-slate-500">Pro munkaterület</p>
+              <p className="text-sm font-bold text-white">{workspaceTitle}</p>
+              <p className="text-[10px] text-slate-500">{workspaceSubtitle}</p>
             </div>
           </div>
         </div>
@@ -1052,7 +1071,7 @@ function MainDashboard({
         <div className="border-t border-slate-800 p-4">
           <div className="mb-3 rounded-lg bg-slate-800/50 p-3">
             <p className="truncate text-xs font-medium text-slate-300">{userEmail}</p>
-            <p className="text-[10px] text-slate-500">NormaFlow Pro aktív</p>
+            <p className="text-[10px] text-slate-500">{workspaceStatusLabel}</p>
           </div>
           <button
             type="button"
@@ -1073,7 +1092,7 @@ function MainDashboard({
             <header className="border-b border-slate-800 bg-slate-900/80 px-4 py-4 backdrop-blur-sm sm:px-6">
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
-                  <h1 className="text-lg font-bold text-white">Munkaterület</h1>
+                  <h1 className="text-lg font-bold text-white">{workspaceSubtitle}</h1>
                   <p className="text-xs text-slate-500">
                     Prioritás szerint rendezett függőben lévő feladatok
                   </p>
@@ -1611,7 +1630,7 @@ function EmailConfigCard({ userEmail }: { userEmail: string }) {
     setSuccess('')
     try {
       const token = await auth.currentUser?.getIdToken(true)
-      const res = await fetch('https://syncemailsnow-cdaanjspxq-uc.a.run.app', {
+      const res = await fetch('https://api-cdaanjspxq-uc.a.run.app/syncEmailsNow', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1835,14 +1854,13 @@ export default function App() {
   const [userEmail, setUserEmail] = useState<string | null>(null)
   const [subscriptionStatus, setSubscriptionStatus] = useState<string>('none')
   const [processedEmailsThisMonth, setProcessedEmailsThisMonth] = useState<number>(0)
-  const [tier, setTier] = useState<string>('basic')
+  const [tier, setTier] = useState<string>('none')
   const [tasks, setTasks] = useState<Task[]>([])
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('Összes')
   const [completingIds, setCompletingIds] = useState<Set<string>>(new Set())
   const [toasts, setToasts] = useState<Toast[]>([])
 
   const hasAccess = subscriptionStatus === 'active'
-  const needsPaywall = subscriptionStatus === 'none' || subscriptionStatus === 'pending'
 
   // AI automation states
   const [activeTab, setActiveTab] = useState<'tasks' | 'automation'>('tasks')
@@ -1877,7 +1895,7 @@ export default function App() {
       if (!user) throw new Error('Nem bejelentkezett felhasználó')
       const token = await user.getIdToken()
 
-      const response = await fetch('https://improveemaildraft-cdaanjspxq-uc.a.run.app', {
+      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/improveEmailDraft', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1923,7 +1941,7 @@ export default function App() {
       if (!user) throw new Error('Nem bejelentkezett felhasználó')
       const token = await user.getIdToken()
 
-      const response = await fetch('https://sendmanualemail-cdaanjspxq-uc.a.run.app', {
+      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/sendManualEmail', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1978,8 +1996,26 @@ export default function App() {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (user) {
         setUserEmail(user.email)
+        if (user.email) {
+          try {
+            const userRef = doc(db, 'users', user.email)
+            const docSnap = await getDoc(userRef)
+            if (docSnap.exists()) {
+              const data = docSnap.data()
+              setSubscriptionStatus(data?.subscriptionStatus ?? 'none')
+              setTier(data?.tier ?? 'none')
+            } else {
+              setSubscriptionStatus('none')
+              setTier('none')
+            }
+          } catch (error) {
+            console.error('Error fetching initial user doc:', error)
+          }
+        }
       } else {
         setUserEmail(null)
+        setSubscriptionStatus('none')
+        setTier('none')
       }
       setAuthReady(true)
     })
@@ -1999,17 +2035,17 @@ export default function App() {
         const data = docSnap.data()
         setSubscriptionStatus(data?.subscriptionStatus ?? 'none')
         setProcessedEmailsThisMonth(data?.processedEmailsThisMonth ?? 0)
-        setTier(data?.tier ?? 'basic')
+        setTier(data?.tier ?? 'none')
       } else {
         setSubscriptionStatus('none')
         setProcessedEmailsThisMonth(0)
-        setTier('basic')
+        setTier('none')
       }
     }, (error) => {
       console.error('Error fetching subscription status:', error)
       setSubscriptionStatus('none')
       setProcessedEmailsThisMonth(0)
-      setTier('basic')
+      setTier('none')
     })
 
     return () => unsubscribe()
@@ -2027,6 +2063,7 @@ export default function App() {
     }
     setUserEmail(null)
     setSubscriptionStatus('none')
+    setTier('none')
     setCategoryFilter('Összes')
     setCompletingIds(new Set())
     setToasts([])
@@ -2037,23 +2074,11 @@ export default function App() {
   const handleSelectTier = async (selectedTier: SubscriptionTier) => {
     if (!userEmail) return
     const userRef = doc(db, 'users', userEmail)
-    await runTransaction(db, async (transaction) => {
-      const snap = await transaction.get(userRef)
-      if (!snap.exists()) {
-        transaction.set(userRef, {
-          email: userEmail,
-          subscriptionStatus: 'active',
-          tier: selectedTier,
-          processedEmailsThisMonth: 0,
-          createdAt: new Date().toISOString(),
-        })
-      } else {
-        transaction.update(userRef, {
-          subscriptionStatus: 'active',
-          tier: selectedTier,
-        })
-      }
-    })
+    await setDoc(userRef, {
+      subscriptionStatus: 'active',
+      tier: selectedTier,
+      processedEmailsThisMonth: 0,
+    }, { merge: true })
   }
 
   const handleCompleteTask = async (id: string) => {
@@ -2063,7 +2088,7 @@ export default function App() {
       if (!user) throw new Error('Nem bejelentkezett felhasználó')
       const token = await user.getIdToken()
 
-      const response = await fetch('https://archivetask-cdaanjspxq-uc.a.run.app', {
+      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/archiveTask', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2105,7 +2130,7 @@ export default function App() {
       if (!user) throw new Error('Nem bejelentkezett felhasználó')
       const token = await user.getIdToken()
 
-      const response = await fetch('https://restoretask-cdaanjspxq-uc.a.run.app', {
+      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/restoreTask', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2321,7 +2346,7 @@ export default function App() {
         <LoginView onAuthenticated={() => {}} />
       )}
 
-      {authReady && userEmail && needsPaywall && (
+      {authReady && userEmail && subscriptionStatus !== 'active' && (
         <PaywallView
           userEmail={userEmail}
           onSelectTier={handleSelectTier}
@@ -2329,7 +2354,7 @@ export default function App() {
         />
       )}
 
-      {authReady && userEmail && hasAccess && (
+      {authReady && userEmail && subscriptionStatus === 'active' && (
         <MainDashboard
           userEmail={userEmail}
           tasks={tasks}

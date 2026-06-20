@@ -41,7 +41,7 @@ export default function FeedbackModal({
       // Programmatically retrieve active ID token from current logged-in accountant session
       const token = await auth.currentUser?.getIdToken(true)
 
-      const response = await fetch('https://handlefeedbacksubmit-cdaanjspxq-uc.a.run.app', {
+      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/handleFeedbackSubmit', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

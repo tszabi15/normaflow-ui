@@ -7,6 +7,8 @@ import { getFirestore } from "firebase-admin/firestore";
 import { OpenAI } from "openai";
 import { ImapFlow } from "imapflow";
 import * as nodemailer from "nodemailer";
+import express from "express";
+import cors from "cors";
 
 // Set global options for the functions (max instances for budget/cost control)
 setGlobalOptions({ maxInstances: 10 });
@@ -107,25 +109,20 @@ function resolveEmailServers(config: EmailConfig): { imapHost: string; imapPort:
  * Replaces Make.com e-mail to task pipeline.
  * Input: POST JSON payload: { sender, subject, textContent, userEmail, userId }
  */
-export const handleIncomingEmail = onRequest({
-  cors: true,
-  secrets: ["OPENAI_API_KEY", "SERVER_WEBHOOK_KEY"],
-  maxInstances: 10,
-  invoker: "public",
-}, async (req, res) => {
+const handleIncomingEmailLogic: express.RequestHandler = async (req, res) => {
   try {
-    // Validate custom server-to-server webhook key
-    const serverKey = req.headers["x-normaflow-server-key"];
-    if (!serverKey || serverKey !== process.env.SERVER_WEBHOOK_KEY) {
-      logger.warn("Unauthorized request to handleIncomingEmail: invalid server key");
-      res.status(401).send("Unauthorized: Invalid server webhook key");
+    // Strict HTTP Method Guard
+    if (req.method !== "POST") {
+      logger.warn(`Method Not Allowed: ${req.method}`);
+      res.status(405).json({ error: "Method Not Allowed" });
       return;
     }
 
-    // Validate Method
-    if (req.method !== "POST") {
-      logger.warn(`Method Not Allowed: ${req.method}`);
-      res.status(405).json({ error: "Method Not Allowed. Must be POST." });
+    // Server Key Protection
+    const serverKey = req.headers["x-normaflow-server-key"];
+    if (!serverKey || serverKey !== process.env.SERVER_WEBHOOK_KEY) {
+      logger.warn("Unauthorized request to handleIncomingEmail: missing or invalid server key");
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
@@ -135,7 +132,7 @@ export const handleIncomingEmail = onRequest({
     // Step A: Validation & Strict Spam Filter
     if (!sender || !textContent || !targetEmail) {
       logger.warn("Validation failed: missing sender, textContent, or targetEmail");
-      res.status(400).json({ error: "Missing required fields: sender, textContent, and userEmail/userId are required." });
+      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -156,8 +153,8 @@ export const handleIncomingEmail = onRequest({
     // Subscription check: verify user has an active subscription
     const userDoc = await db.collection("users").doc(targetEmail).get();
     const userData = userDoc.exists ? userDoc.data() : null;
-    if (!userData || userData.subscriptionStatus !== "active") {
-      logger.warn(`Forbidden request to handleIncomingEmail: user ${targetEmail} does not have an active subscription`);
+    if (!userData || userData.subscriptionStatus !== "active" || userData.tier === "none") {
+      logger.warn(`Forbidden request to handleIncomingEmail: user ${targetEmail} does not have an active subscription or has tier "none"`);
       res.status(403).json({
         error: "Forbidden: Account requires an active subscription to process background email automation."
       });
@@ -166,13 +163,14 @@ export const handleIncomingEmail = onRequest({
 
     // Quota evaluation
     const processedEmailsThisMonth = userData.processedEmailsThisMonth || 0;
-    const tier = userData.tier || "basic";
+    const tier = userData.tier || "none";
     const tierLimits: Record<string, number> = {
+      none: 0,
       basic: 500,
       pro: 1500,
       ultra: 5000,
     };
-    const limit = tierLimits[tier] || 500;
+    const limit = tierLimits[tier] || 0;
     if (processedEmailsThisMonth >= limit) {
       logger.warn(`Quota exceeded for user ${targetEmail}: ${processedEmailsThisMonth} >= ${limit}`);
       res.status(403).json({
@@ -304,7 +302,7 @@ A választ szigorúan JSON formátumban add vissza, az alábbi kulcsokkal:
       message: errorMessage,
     });
   }
-});
+};
 
 /**
  * SUBSYSTEM 2: handleFeedbackSubmit
@@ -312,11 +310,7 @@ A választ szigorúan JSON formátumban add vissza, az alábbi kulcsokkal:
  * Input: POST JSON payload: { title, category, description }
  * Authentication: Enforced ID Token validation via Authorization header
  */
-export const handleFeedbackSubmit = onRequest({
-  cors: true,
-  maxInstances: 10,
-  invoker: "public",
-}, async (req, res) => {
+const handleFeedbackSubmitLogic: express.RequestHandler = async (req, res) => {
   try {
     if (req.method === 'OPTIONS') {
       res.set('Access-Control-Allow-Origin', '*');
@@ -326,28 +320,41 @@ export const handleFeedbackSubmit = onRequest({
       return;
     }
 
+    // Validate Method
+    if (req.method !== "POST") {
+      logger.warn(`Method Not Allowed: ${req.method}`);
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
     // Verify JWT ID Token from Authorization header
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
       logger.warn("Unauthorized request to handleFeedbackSubmit: missing or invalid authorization header");
-      res.status(401).send("Unauthorized: Missing or invalid Authorization header");
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
     const idToken = authHeader.split("Bearer ")[1];
+    if (!idToken || idToken.trim() === "") {
+      logger.warn("Unauthorized request to handleFeedbackSubmit: empty token payload");
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
     let decodedToken;
     try {
       decodedToken = await admin.auth().verifyIdToken(idToken);
     } catch (err: any) {
       logger.error("Token verification failed:", err);
-      res.status(401).send("Unauthorized: Invalid token");
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
     const verifiedUserEmail = decodedToken.email;
     if (!verifiedUserEmail) {
       logger.warn("Unauthorized request to handleFeedbackSubmit: token contains no email");
-      res.status(401).send("Unauthorized: Token contains no email");
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
@@ -355,26 +362,16 @@ export const handleFeedbackSubmit = onRequest({
     const userDoc = await admin.firestore().collection('users').doc(verifiedUserEmail).get();
     if (!userDoc.exists || userDoc.data()?.subscriptionStatus !== 'active') {
       logger.warn(`Forbidden request to handleFeedbackSubmit: user ${verifiedUserEmail} does not have an active subscription`);
-      res.status(403).send("Forbidden: Active subscription required to submit feedback");
-      return;
-    }
-
-    // Validate Method
-    if (req.method !== "POST") {
-      logger.warn(`Method Not Allowed: ${req.method}`);
-      res.status(405).json({ error: "Method Not Allowed. Must be POST." });
+      res.status(403).json({ error: "Forbidden: Active subscription required to submit feedback" });
       return;
     }
 
     const { title, category, description } = req.body as Partial<FeedbackSubmitRequest>;
 
     // Step A: Validation
-    if (!title || !category) {
-      logger.warn("Validation failed: missing title or category");
-      res.status(400).json({
-        error: "Bad Request",
-        message: "Missing required fields. 'title' and 'category' are required.",
-      });
+    if (!title || typeof title !== "string" || title.trim() === "" || !category || typeof category !== "string" || category.trim() === "") {
+      logger.warn("Validation failed: missing or empty title or category");
+      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -404,7 +401,7 @@ export const handleFeedbackSubmit = onRequest({
       message: errorMessage,
     });
   }
-});
+};
 
 // ─── SUBSYSTEM 3: syncEmails (Scheduled IMAP Sync) ───────────────────────────
 
@@ -419,19 +416,20 @@ async function performEmailSync(targetEmail: string): Promise<number> {
   // Load user details
   const userDoc = await db.collection("users").doc(targetEmail).get();
   const userData = userDoc.exists ? userDoc.data() : null;
-  if (!userData || userData.subscriptionStatus !== "active") {
-    logger.warn(`performEmailSync: User ${targetEmail} does not have an active subscription.`);
+  if (!userData || userData.subscriptionStatus !== "active" || userData.tier === "none") {
+    logger.warn(`performEmailSync: User ${targetEmail} does not have an active subscription or has tier "none".`);
     return 0;
   }
 
   let processedEmailsThisMonth = userData.processedEmailsThisMonth || 0;
-  const tier = userData.tier || "basic";
+  const tier = userData.tier || "none";
   const tierLimits: Record<string, number> = {
+    none: 0,
     basic: 500,
     pro: 1500,
     ultra: 5000,
   };
-  const limit = tierLimits[tier] || 500;
+  const limit = tierLimits[tier] || 0;
 
   if (processedEmailsThisMonth >= limit) {
     logger.warn(`performEmailSync: User ${targetEmail} already reached their monthly limit.`);
@@ -667,12 +665,7 @@ export const syncEmails = onSchedule({
  * Called by the frontend "Levelek szinkronizálása" button.
  * JWT-authenticated + subscription-gated.
  */
-export const syncEmailsNow = onRequest({
-  cors: true,
-  secrets: ["OPENAI_API_KEY"],
-  maxInstances: 5,
-  invoker: "public",
-}, async (req, res) => {
+const syncEmailsNowLogic: express.RequestHandler = async (req, res) => {
   try {
     if (req.method === "OPTIONS") {
       res.set("Access-Control-Allow-Origin", "*");
@@ -682,21 +675,27 @@ export const syncEmailsNow = onRequest({
       return;
     }
 
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
     // Auth
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
     const authResult = await verifyAuthToken(req);
     if (!authResult) {
-      res.status(401).send("Unauthorized");
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
     // Subscription check
     if (!(await checkSubscription(authResult.email))) {
-      res.status(403).send("Forbidden: Active subscription required");
-      return;
-    }
-
-    if (req.method !== "POST") {
-      res.status(405).json({ error: "Method Not Allowed. Must be POST." });
+      res.status(403).json({ error: "Forbidden: Active subscription required" });
       return;
     }
 
@@ -713,7 +712,7 @@ export const syncEmailsNow = onRequest({
     logger.error("syncEmailsNow error:", errorMessage);
     res.status(500).json({ error: "Internal Server Error", message: errorMessage });
   }
-});
+};
 
 // ─── SUBSYSTEM 5: sendAiReply (SMTP Email Sender) ───────────────────────────
 
@@ -722,11 +721,7 @@ export const syncEmailsNow = onRequest({
  * corporate SMTP server. JWT-authenticated + subscription-gated.
  * Input: { taskId, replyBody, recipientEmail }
  */
-export const sendAiReply = onRequest({
-  cors: true,
-  maxInstances: 5,
-  invoker: "public",
-}, async (req, res) => {
+const sendAiReplyLogic: express.RequestHandler = async (req, res) => {
   try {
     if (req.method === "OPTIONS") {
       res.set("Access-Control-Allow-Origin", "*");
@@ -739,7 +734,7 @@ export const sendAiReply = onRequest({
     // Auth
     const authResult = await verifyAuthToken(req);
     if (!authResult) {
-      res.status(401).send("Unauthorized");
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
@@ -756,7 +751,7 @@ export const sendAiReply = onRequest({
 
     const { taskId, replyBody, recipientEmail } = req.body as Partial<SendAiReplyRequest>;
     if (!taskId || !replyBody || !recipientEmail) {
-      res.status(400).json({ error: "Missing required fields: taskId, replyBody, recipientEmail." });
+      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -821,23 +816,31 @@ export const sendAiReply = onRequest({
     logger.error("sendAiReply error:", errorMessage);
     res.status(500).json({ error: "Internal Server Error", message: errorMessage });
   }
-});
+};
 
 /**
  * SUBSYSTEM 5: sendManualEmail
  * Authenticated POST endpoint to compose and send manual SMTP replies.
  */
-export const sendManualEmail = onRequest({
-  cors: true,
-  maxInstances: 10,
-  invoker: "public",
-}, async (req, res) => {
+const sendManualEmailLogic: express.RequestHandler = async (req, res) => {
   try {
     if (req.method === 'OPTIONS') {
       res.set('Access-Control-Allow-Origin', '*');
       res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
       res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    // Auth header structure check
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
@@ -861,8 +864,11 @@ export const sendManualEmail = onRequest({
       body: string;
     };
 
-    if (!taskId || !recipient || !subject || !body) {
-      res.status(400).json({ error: "Missing required fields: taskId, recipient, subject, body" });
+    if (!taskId || typeof taskId !== "string" || taskId.trim() === "" ||
+        !recipient || typeof recipient !== "string" || recipient.trim() === "" ||
+        !subject || typeof subject !== "string" || subject.trim() === "" ||
+        !body || typeof body !== "string" || body.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -907,24 +913,31 @@ export const sendManualEmail = onRequest({
     logger.error("Error in sendManualEmail:", errMsg);
     res.status(500).json({ error: "Internal Server Error", message: errMsg });
   }
-});
+};
 
 /**
  * SUBSYSTEM 6: improveEmailDraft
  * Authenticated POST endpoint to professionalize draft content using AI.
  */
-export const improveEmailDraft = onRequest({
-  cors: true,
-  maxInstances: 10,
-  invoker: "public",
-  secrets: ["OPENAI_API_KEY"],
-}, async (req, res) => {
+const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
   try {
     if (req.method === 'OPTIONS') {
       res.set('Access-Control-Allow-Origin', '*');
       res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
       res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
       res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    // Auth header structure check
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
@@ -942,8 +955,8 @@ export const improveEmailDraft = onRequest({
     }
 
     const { text } = req.body as { text: string };
-    if (!text || !text.trim()) {
-      res.status(400).json({ error: "Missing required field: text" });
+    if (!text || typeof text !== "string" || text.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -972,7 +985,7 @@ export const improveEmailDraft = onRequest({
     logger.error("Error in improveEmailDraft:", errMsg);
     res.status(500).json({ error: "Internal Server Error", message: errMsg });
   }
-});
+};
 
 /**
  * Automated Daily Task Cleanup Cron Job
@@ -1025,8 +1038,20 @@ export const cleanupExpiredTasks = onSchedule({ schedule: "0 0 * * *" }, async (
  * Archive Task (Soft Delete)
  * Marks a task as status: "archived" and sets archivedAt timestamp.
  */
-export const archiveTask = onRequest({ cors: true }, async (req, res) => {
+const archiveTaskLogic: express.RequestHandler = async (req, res) => {
   try {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    // Auth header structure check
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
     const verifiedUser = await verifyAuthToken(req);
     if (!verifiedUser) {
       res.status(401).json({ error: "Unauthorized" });
@@ -1040,8 +1065,8 @@ export const archiveTask = onRequest({ cors: true }, async (req, res) => {
     }
 
     const { taskId } = req.body as { taskId: string };
-    if (!taskId) {
-      res.status(400).json({ error: "Missing required field: taskId" });
+    if (!taskId || typeof taskId !== "string" || taskId.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -1068,14 +1093,26 @@ export const archiveTask = onRequest({ cors: true }, async (req, res) => {
     logger.error("Error in archiveTask:", errMsg);
     res.status(500).json({ error: "Internal Server Error", message: errMsg });
   }
-});
+};
 
 /**
  * Restore Task (Undo Soft Delete)
  * Sets task status to "active", clears archivedAt, and resets ai_status to "pending_review".
  */
-export const restoreTask = onRequest({ cors: true }, async (req, res) => {
+const restoreTaskLogic: express.RequestHandler = async (req, res) => {
   try {
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    // Auth header structure check
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
     const verifiedUser = await verifyAuthToken(req);
     if (!verifiedUser) {
       res.status(401).json({ error: "Unauthorized" });
@@ -1089,8 +1126,8 @@ export const restoreTask = onRequest({ cors: true }, async (req, res) => {
     }
 
     const { taskId } = req.body as { taskId: string };
-    if (!taskId) {
-      res.status(400).json({ error: "Missing required field: taskId" });
+    if (!taskId || typeof taskId !== "string" || taskId.trim() === "") {
+      res.status(400).json({ error: "Bad Request" });
       return;
     }
 
@@ -1117,4 +1154,26 @@ export const restoreTask = onRequest({ cors: true }, async (req, res) => {
     logger.error("Error in restoreTask:", errMsg);
     res.status(500).json({ error: "Internal Server Error", message: errMsg });
   }
-});
+};
+
+// ─── Central Express Routing Subsystem ──────────────────────────────────────
+
+const app = express();
+app.use(cors({ origin: true }));
+app.use(express.json());
+
+app.post("/handleIncomingEmail", handleIncomingEmailLogic);
+app.post("/improveEmailDraft", improveEmailDraftLogic);
+app.post("/sendManualEmail", sendManualEmailLogic);
+app.post("/syncEmailsNow", syncEmailsNowLogic);
+app.post("/archiveTask", archiveTaskLogic);
+app.post("/restoreTask", restoreTaskLogic);
+app.post("/handleFeedbackSubmit", handleFeedbackSubmitLogic);
+app.post("/sendAiReply", sendAiReplyLogic);
+
+export const api = onRequest({
+  cors: true,
+  secrets: ["OPENAI_API_KEY", "SERVER_WEBHOOK_KEY"],
+  maxInstances: 10,
+  invoker: "public",
+}, app);
