@@ -415,18 +415,31 @@ export const scheduledImapPolling = onSchedule({
                     received_via: "imap"
                   });
 
+                  let shouldMarkSeen = true;
+
                   try {
                     const aiConfigDoc = await db.doc(`users/${userId}/settings/ai_configuration`).get();
                     if (aiConfigDoc.exists && aiConfigDoc.data()?.globalAutomationEnabled === true) {
                       logger.info(`scheduledImapPolling: Auto-processing email ${emailDocRef.id} for user ${userEmail}`);
-                      await processEmailInternally(emailDocRef.id, userEmail);
+                      const result = await processEmailInternally(emailDocRef.id, userEmail);
+                      if (result.status !== "success" && result.status !== "filtered") {
+                        shouldMarkSeen = false;
+                        logger.warn(`scheduledImapPolling: AI processing not successful (status: ${result.status}). Leaving email as unseen.`);
+                      }
                     }
                   } catch (autoErr: unknown) {
+                    shouldMarkSeen = false;
                     const autoErrMsg = autoErr instanceof Error ? autoErr.message : String(autoErr);
                     logger.error(`scheduledImapPolling: Automatic processing failed for email ${emailDocRef.id}:`, autoErrMsg);
                   }
 
-                  await client.messageFlagsAdd(String(seq), ["\\Seen"]);
+                  if (shouldMarkSeen) {
+                    await client.messageFlagsAdd(String(seq), ["\\Seen"]);
+                  } else {
+                    // Delete the email document to prevent duplicates on retry
+                    logger.info(`scheduledImapPolling: Cleaning up email doc ${emailDocRef.id} to avoid duplication on next retry`);
+                    await emailDocRef.delete();
+                  }
                 }
               } else {
                 logger.info(`scheduledImapPolling: No unseen messages for ${emailAddress}`);
@@ -1540,12 +1553,46 @@ const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
 
         const tier = (session.metadata?.tier || "basic") as 'basic' | 'pro' | 'ultra';
 
-        logger.info(`stripeWebhookHandler: Setting user ${customerEmail} subscription to active, tier ${tier}`);
-        await db.collection("users").doc(customerEmail).set({
+        // Retrieve existing user document to check previous status and tier
+        const userDoc = await db.collection("users").doc(customerEmail).get();
+        let shouldReset = true;
+        let previousTier = "none";
+        if (userDoc.exists) {
+          const data = userDoc.data();
+          const previousStatus = data?.subscriptionStatus || "none";
+          previousTier = data?.tier || "none";
+          if (previousStatus === "active") {
+            shouldReset = false;
+          }
+        }
+
+        const TIER_RANKS: Record<string, number> = {
+          none: 0,
+          basic: 1,
+          pro: 2,
+          ultra: 3
+        };
+        const newRank = TIER_RANKS[tier] || 0;
+        const oldRank = TIER_RANKS[previousTier] || 0;
+        if (newRank > oldRank) {
+          shouldReset = true;
+        }
+
+        logger.info(`stripeWebhookHandler: Setting user ${customerEmail} subscription to active, tier ${tier}. shouldReset: ${shouldReset}`);
+
+        const updateData: {
+          subscriptionStatus: string;
+          tier: 'basic' | 'pro' | 'ultra';
+          processedEmailsThisMonth?: number;
+        } = {
           subscriptionStatus: "active",
-          tier: tier,
-          processedEmailsThisMonth: 0
-        }, { merge: true });
+          tier: tier
+        };
+        if (shouldReset) {
+          updateData.processedEmailsThisMonth = 0;
+        }
+
+        await db.collection("users").doc(customerEmail).set(updateData, { merge: true });
         break;
       }
 
@@ -1559,12 +1606,46 @@ const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
 
         const tier = (subscription.metadata?.tier || "basic") as 'basic' | 'pro' | 'ultra';
 
-        logger.info(`stripeWebhookHandler: Setting user ${customerEmail} subscription to active, tier ${tier}`);
-        await db.collection("users").doc(customerEmail).set({
+        // Retrieve existing user document to check previous status and tier
+        const userDoc = await db.collection("users").doc(customerEmail).get();
+        let shouldReset = true;
+        let previousTier = "none";
+        if (userDoc.exists) {
+          const data = userDoc.data();
+          const previousStatus = data?.subscriptionStatus || "none";
+          previousTier = data?.tier || "none";
+          if (previousStatus === "active") {
+            shouldReset = false;
+          }
+        }
+
+        const TIER_RANKS: Record<string, number> = {
+          none: 0,
+          basic: 1,
+          pro: 2,
+          ultra: 3
+        };
+        const newRank = TIER_RANKS[tier] || 0;
+        const oldRank = TIER_RANKS[previousTier] || 0;
+        if (newRank > oldRank) {
+          shouldReset = true;
+        }
+
+        logger.info(`stripeWebhookHandler: Setting user ${customerEmail} subscription to active, tier ${tier}. shouldReset: ${shouldReset}`);
+
+        const updateData: {
+          subscriptionStatus: string;
+          tier: 'basic' | 'pro' | 'ultra';
+          processedEmailsThisMonth?: number;
+        } = {
           subscriptionStatus: "active",
-          tier: tier,
-          processedEmailsThisMonth: 0
-        }, { merge: true });
+          tier: tier
+        };
+        if (shouldReset) {
+          updateData.processedEmailsThisMonth = 0;
+        }
+
+        await db.collection("users").doc(customerEmail).set(updateData, { merge: true });
         break;
       }
 
