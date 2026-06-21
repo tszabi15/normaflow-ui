@@ -620,6 +620,19 @@ const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    // Hardening: Resolve the user's specific billing account tracking document using getUserQuota
+    const userQuota = await getUserQuota(authResult.uid);
+    if (!userQuota) {
+      res.status(403).json({ error: "Forbidden: Failed to resolve billing account tracking" });
+      return;
+    }
+
+    // Run the quota consumption check
+    if (hasExceededQuota(userQuota)) {
+      res.status(403).json({ error: "Forbidden: Monthly email quota limit exceeded" });
+      return;
+    }
+
     if (!process.env.OPENAI_API_KEY) {
       res.status(500).json({ error: "OpenAI API key not configured" });
       return;
@@ -640,9 +653,57 @@ const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
 
     const enhancedText = response.choices[0]?.message?.content?.trim() || text;
     res.status(200).json({ status: "success", text: enhancedText });
-  } catch (err: any) {
+  } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error("Error in improveEmailDraft:", errMsg);
+    res.status(500).json({ error: "Internal Server Error", message: errMsg });
+  }
+};
+
+interface VerifySubscriptionRequest {
+  tier: string;
+}
+
+const verifySubscriptionLogic: express.RequestHandler = async (req, res) => {
+  try {
+    if (req.method === 'OPTIONS') {
+      res.set('Access-Control-Allow-Origin', '*');
+      res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+      res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.status(204).send('');
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    const authResult = await verifyAuthToken(req);
+    if (!authResult) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const { tier } = req.body as Partial<VerifySubscriptionRequest>;
+    if (!tier || !["basic", "pro", "ultra"].includes(tier)) {
+      res.status(400).json({ error: "Bad Request", message: "Invalid or missing tier" });
+      return;
+    }
+
+    logger.info(`verifySubscriptionLogic: Updating user ${authResult.email} to tier ${tier}`);
+
+    const userRef = db.collection("users").doc(authResult.email);
+    await userRef.set({
+      subscriptionStatus: "active",
+      tier: tier,
+      processedEmailsThisMonth: 0,
+    }, { merge: true });
+
+    res.status(200).json({ status: "success", message: `Előfizetés sikeresen aktiválva: ${tier}` });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("Error in verifySubscription:", errMsg);
     res.status(500).json({ error: "Internal Server Error", message: errMsg });
   }
 };
@@ -1205,7 +1266,8 @@ const registeredRoutes = [
   "/restoreTask",
   "/handleFeedbackSubmit",
   "/sendAiReply",
-  "/processEmailWithAi"
+  "/processEmailWithAi",
+  "/verifySubscription"
 ];
 
 app.use((req, res, next) => {
@@ -1226,6 +1288,7 @@ app.post("/restoreTask", restoreTaskLogic);
 app.post("/handleFeedbackSubmit", handleFeedbackSubmitLogic);
 app.post("/sendAiReply", sendAiReplyLogic);
 app.post("/processEmailWithAi", processEmailWithAiLogic);
+app.post("/verifySubscription", verifySubscriptionLogic);
 app.delete("/emails/:emailId", deleteEmailLogic);
 
 export const api = onRequest({
