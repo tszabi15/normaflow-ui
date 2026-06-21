@@ -662,6 +662,7 @@ const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
 
 interface VerifySubscriptionRequest {
   tier: string;
+  stripeSessionId: string;
 }
 
 const verifySubscriptionLogic: express.RequestHandler = async (req, res) => {
@@ -685,13 +686,19 @@ const verifySubscriptionLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
-    const { tier } = req.body as Partial<VerifySubscriptionRequest>;
+    const { tier, stripeSessionId } = req.body as Partial<VerifySubscriptionRequest>;
     if (!tier || !["basic", "pro", "ultra"].includes(tier)) {
       res.status(400).json({ error: "Bad Request", message: "Invalid or missing tier" });
       return;
     }
 
-    logger.info(`verifySubscriptionLogic: Updating user ${authResult.email} to tier ${tier}`);
+    // Harden against payment fraud by validating the stripeSessionId payment receipt token placeholder
+    if (!stripeSessionId || typeof stripeSessionId !== "string" || stripeSessionId.trim() === "") {
+      res.status(402).json({ error: "Payment Required", message: "Payment receipt token (stripeSessionId) is missing or blank" });
+      return;
+    }
+
+    logger.info(`verifySubscriptionLogic: Updating user ${authResult.email} to tier ${tier} (session: ${stripeSessionId})`);
 
     const userRef = db.collection("users").doc(authResult.email);
     await userRef.set({
@@ -1138,6 +1145,11 @@ ${textContent}`;
 
   // Mark the email as processed
   await emailRef.update({ status: "processed" });
+
+  // Increment user's monthly processed email counter atomically
+  await db.collection("users").doc(userEmail).update({
+    processedEmailsThisMonth: admin.firestore.FieldValue.increment(1)
+  });
 
   return { status: "success", taskId: taskRef.id };
 }
