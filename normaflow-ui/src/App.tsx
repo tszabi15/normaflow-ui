@@ -1,13 +1,9 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import {
-  Check,
   LogOut,
   Mail,
-  Clock,
   AlertTriangle,
   Zap,
-  Shield,
-  CreditCard,
   Inbox,
   Filter,
   Bell,
@@ -20,20 +16,17 @@ import {
 } from 'lucide-react'
 
 // Import components and types
-import type { Task, TaskCategory, TaskPriority } from './types/task'
-import AutoResponder from './components/dashboard/AutoResponder'
+import type { Task, TaskCategory } from './types/task'
+import AiSettings from './components/dashboard/AiSettings'
 import FeedbackModal from './components/dashboard/FeedbackModal'
 import EmailInboxPanel from './components/dashboard/EmailInboxPanel'
+import LoginView from './components/auth/LoginView'
+import PaywallView from './components/dashboard/PaywallView'
+import TaskCard from './components/dashboard/TaskCard'
+import ManualReplyModal from './components/dashboard/ManualReplyModal'
 import { db, auth } from './firebase'
 import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc } from 'firebase/firestore'
-import {
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  signOut,
-  onAuthStateChanged,
-  GoogleAuthProvider,
-  signInWithPopup,
-} from 'firebase/auth'
+import { signOut } from 'firebase/auth'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -56,38 +49,6 @@ const TIER_LIMITS: Record<SubscriptionTier, number> = {
   ultra: 5000,
 }
 
-const PRICING_PLANS: {
-  tier: SubscriptionTier
-  name: string
-  price: string
-  emails: number
-  features: string[]
-  highlighted?: boolean
-}[] = [
-  {
-    tier: 'basic',
-    name: 'Basic',
-    price: '9.990',
-    emails: 500,
-    features: ['500 e-mail / hó', 'AI feladat összegzés', 'Prioritás-sorrendezés', '30 napos kuka'],
-  },
-  {
-    tier: 'pro',
-    name: 'Pro',
-    price: '19.990',
-    emails: 1500,
-    features: ['1500 e-mail / hó', 'AI auto-választervezet', 'Ügyfél fehérlista', 'Prioritás riasztások'],
-    highlighted: true,
-  },
-  {
-    tier: 'ultra',
-    name: 'Ultra',
-    price: '39.990',
-    emails: 5000,
-    features: ['5000 e-mail / hó', 'Teljes automatizáció', 'Dedikált támogatás', 'Audit napló'],
-  },
-]
-
 const CATEGORIES: TaskCategory[] = [
   'NAV / Hivatalos',
   'Sürgős teendő',
@@ -102,68 +63,6 @@ const CATEGORY_FILTERS: CategoryFilter[] = ['Összes', ...CATEGORIES]
 
 function generateId(): string {
   return `task-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
-}
-
-function formatTimestamp(iso: string): string {
-  const date = new Date(iso)
-  const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
-  const diffMins = Math.floor(diffMs / 60_000)
-  const diffHours = Math.floor(diffMs / 3_600_000)
-  const diffDays = Math.floor(diffMs / 86_400_000)
-
-  if (diffMins < 1) return 'Épp most'
-  if (diffMins < 60) return `${diffMins} perce`
-  if (diffHours < 24) return `${diffHours} órája`
-  if (diffDays < 7) return `${diffDays} napja`
-
-  return date.toLocaleDateString('hu-HU', {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
-
-
-// ─── Mock Database ───────────────────────────────────────────────────────────
-
-// ─── Priority Styling ────────────────────────────────────────────────────────
-
-const PRIORITY_STYLES: Record<
-  TaskPriority,
-  { border: string; glow: string; badge: string; label: string }
-> = {
-  5: {
-    border: 'border-red-600',
-    glow: 'shadow-red-900/50',
-    badge: 'bg-red-600 text-white animate-pulse',
-    label: 'CRITICAL / SOS',
-  },
-  4: {
-    border: 'border-orange-500',
-    glow: 'shadow-orange-900/40',
-    badge: 'bg-orange-500/20 text-orange-300',
-    label: 'Magas',
-  },
-  3: {
-    border: 'border-yellow-500/70',
-    glow: 'shadow-yellow-900/30',
-    badge: 'bg-yellow-500/20 text-yellow-300',
-    label: 'Közepes',
-  },
-  2: {
-    border: 'border-blue-500/50',
-    glow: 'shadow-blue-900/20',
-    badge: 'bg-blue-500/20 text-blue-300',
-    label: 'Alacsony',
-  },
-  1: {
-    border: 'border-zinc-700',
-    glow: 'shadow-none',
-    badge: 'bg-zinc-800 text-zinc-500',
-    label: 'Minimális',
-  },
 }
 
 // ─── Toast Component ─────────────────────────────────────────────────────────
@@ -204,646 +103,7 @@ function ToastNotification({
   )
 }
 
-async function ensureUserDocument(email: string, uid?: string): Promise<void> {
-  const userRef = doc(db, 'users', email)
-  const snap = await getDoc(userRef)
-  if (!snap.exists()) {
-    await setDoc(userRef, {
-      email,
-      uid: uid || '',
-      subscriptionStatus: 'none',
-      tier: 'none',
-      processedEmailsThisMonth: 0,
-      createdAt: new Date().toISOString(),
-    })
-  } else if (uid) {
-    await setDoc(userRef, { uid }, { merge: true })
-  }
-}
-
-// ─── LoginView ───────────────────────────────────────────────────────────────
-
-function LoginView({ onAuthenticated }: { onAuthenticated: () => void }) {
-  const [isLoading, setIsLoading] = useState(false)
-  const [isSignUp, setIsSignUp] = useState(false)
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError] = useState('')
-
-  const completeSignIn = async (signedInEmail: string, uid?: string) => {
-    await ensureUserDocument(signedInEmail, uid)
-    onAuthenticated()
-  }
-
-  const handleEmailPasswordSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!email.trim() || !password.trim()) return
-    setIsLoading(true)
-    setError('')
-    try {
-      if (isSignUp) {
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password)
-        await ensureUserDocument(userCredential.user.email || email, userCredential.user.uid)
-        onAuthenticated()
-      } else {
-        const userCredential = await signInWithEmailAndPassword(auth, email, password)
-        await completeSignIn(userCredential.user.email || email, userCredential.user.uid)
-      }
-    } catch (err: any) {
-      let errMsg = err.message
-      if (err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password' || err.code === 'auth/invalid-credential') {
-        errMsg = 'Érvénytelen e-mail cím vagy jelszó.'
-      } else if (err.code === 'auth/email-already-in-use') {
-        errMsg = 'Ez az e-mail cím már használatban van.'
-      } else if (err.code === 'auth/weak-password') {
-        errMsg = 'A jelszónak legalább 6 karakterből kell állnia.'
-      }
-      setError(errMsg)
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  const handleGoogleLogin = async () => {
-    setIsLoading(true)
-    setError('')
-    try {
-      const provider = new GoogleAuthProvider()
-      const result = await signInWithPopup(auth, provider)
-      await ensureUserDocument(result.user.email || '', result.user.uid)
-      onAuthenticated()
-    } catch (err: any) {
-      if (err.code === 'auth/popup-closed-by-user') {
-        setError('A Google bejelentkezés megszakítva.')
-      } else {
-        setError(err.message || 'Google bejelentkezés sikertelen.')
-      }
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  return (
-    <div className="flex min-h-screen bg-slate-950">
-      {/* Left — Brand */}
-      <div className="relative hidden flex-1 flex-col justify-between overflow-hidden p-12 lg:flex">
-        <div className="absolute inset-0 bg-gradient-to-br from-indigo-950/40 via-slate-950 to-slate-950" />
-        <div className="absolute -left-32 top-1/4 h-96 w-96 rounded-full bg-indigo-600/10 blur-3xl" />
-        <div className="absolute -right-16 bottom-1/4 h-64 w-64 rounded-full bg-violet-600/10 blur-3xl" />
-
-        <div className="relative z-10">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-indigo-600">
-              <Zap className="h-5 w-5 text-white" />
-            </div>
-            <span className="text-xl font-bold tracking-tight text-white">NormaFlow</span>
-          </div>
-        </div>
-
-        <div className="relative z-10 max-w-lg">
-          <h1 className="text-4xl font-bold leading-tight tracking-tight text-white xl:text-5xl">
-            Intelligens könyvelési munkafolyamat automatizálás
-          </h1>
-          <p className="mt-6 text-lg leading-relaxed text-slate-400">
-            Az e-mailekből automatikusan kinyert, priorizált feladatok egyetlen
-            munkaterületen. Kevesebb adminisztráció, több idő az ügyfelekre.
-          </p>
-
-          <div className="mt-10 space-y-4">
-            {[
-              'NAV értesítések azonnali kiemelése',
-              'Automatikus prioritás-sorrendezés',
-              'Valós idejű feladat-stream',
-            ].map((feature) => (
-              <div key={feature} className="flex items-center gap-3">
-                <div className="flex h-6 w-6 items-center justify-center rounded-full bg-indigo-500/20">
-                  <Check className="h-3.5 w-3.5 text-indigo-400" />
-                </div>
-                <span className="text-sm text-slate-300">{feature}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <p className="relative z-10 text-xs text-slate-600">
-          © 2026 NormaFlow Kft. · Magyar könyvelőknek, magyar könyvelőktől.
-        </p>
-      </div>
-
-      {/* Right — Login Card */}
-      <div className="flex flex-1 items-center justify-center p-6 sm:p-12">
-        <div className="w-full max-w-md">
-          <div className="mb-8 flex items-center gap-3 lg:hidden">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-600">
-              <Zap className="h-4 w-4 text-white" />
-            </div>
-            <span className="text-lg font-bold text-white">NormaFlow</span>
-          </div>
-
-          <div className="rounded-2xl border border-slate-800 bg-slate-900/80 p-8 shadow-2xl backdrop-blur-sm">
-            <div className="mb-2 flex items-center gap-2">
-              <Shield className="h-4 w-4 text-indigo-400" />
-              <span className="text-xs font-medium uppercase tracking-wider text-indigo-400">
-                Biztonságos belépés
-              </span>
-            </div>
-            <h2 className="text-2xl font-bold text-white">
-              {isSignUp ? 'Regisztráció' : 'Üdvözöljük vissza'}
-            </h2>
-            <p className="mt-2 text-sm text-slate-400">
-              {isSignUp
-                ? 'Hozza létre fiókját az intelligens könyvelői felület használatához.'
-                : 'Jelentkezzen be a munkaterület eléréséhez.'}
-            </p>
-
-            {error && (
-              <div className="mt-4 rounded-lg bg-red-500/15 border border-red-500/20 p-3 text-xs font-medium text-red-400">
-                {error}
-              </div>
-            )}
-
-            <form onSubmit={handleEmailPasswordSubmit} className="mt-6 space-y-4">
-                <div>
-                  <label htmlFor="email-input" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    E-mail cím
-                  </label>
-                  <input
-                    id="email-input"
-                    type="email"
-                    required
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="kovacs.kata@normaflow.hu"
-                    className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3.5 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                </div>
-
-                <div>
-                  <label htmlFor="password-input" className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                    Jelszó
-                  </label>
-                  <input
-                    id="password-input"
-                    type="password"
-                    required
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••"
-                    className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3.5 text-sm text-slate-200 placeholder-slate-600 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isLoading}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-6 py-3.5 text-sm font-semibold text-white shadow-lg shadow-indigo-900/30 transition-all hover:bg-indigo-500 hover:shadow-indigo-800/40 active:scale-95 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {isLoading ? (
-                    <span className="flex items-center gap-2">
-                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-indigo-400 border-t-white" />
-                      Feldolgozás…
-                    </span>
-                  ) : isSignUp ? (
-                    'Regisztráció'
-                  ) : (
-                    'Belépés'
-                  )}
-                </button>
-
-                <div className="relative flex py-2 items-center">
-                  <div className="flex-grow border-t border-slate-800"></div>
-                  <span className="flex-shrink mx-4 text-[10px] uppercase font-semibold text-slate-600 tracking-wider">vagy</span>
-                  <div className="flex-grow border-t border-slate-800"></div>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleGoogleLogin}
-                  disabled={isLoading}
-                  className="flex w-full items-center justify-center gap-3 rounded-xl border border-slate-700 bg-white px-6 py-3.5 text-sm font-semibold text-slate-900 transition-all hover:bg-slate-100 hover:shadow-lg disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  <svg className="h-5 w-5" viewBox="0 0 24 24" aria-hidden="true">
-                    <path
-                      d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"
-                      fill="#4285F4"
-                    />
-                    <path
-                      d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                      fill="#34A853"
-                    />
-                    <path
-                      d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
-                      fill="#FBBC05"
-                    />
-                    <path
-                      d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
-                      fill="#EA4335"
-                    />
-                  </svg>
-                  Belépés Google fiókkal
-                </button>
-
-                <div className="mt-6 text-center">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsSignUp(!isSignUp)
-                      setError('')
-                    }}
-                    className="text-xs font-semibold text-indigo-400 hover:underline"
-                  >
-                    {isSignUp ? 'Már van fiókja? Belépés' : 'Nincs még fiókja? Regisztráció'}
-                  </button>
-                </div>
-              </form>
-
-            <p className="mt-6 text-center text-xs text-slate-600">
-              A belépéssel elfogadja az{' '}
-              <span className="text-slate-500 underline decoration-slate-700">
-                Általános Szerződési Feltételeket
-              </span>
-              .
-            </p>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-
-
-// ─── PaywallView ─────────────────────────────────────────────────────────────
-
-function PaywallView({
-  userEmail,
-  onSelectTier,
-  onLogout,
-}: {
-  userEmail: string
-  onSelectTier: (tier: SubscriptionTier) => Promise<void>
-  onLogout: () => void
-}) {
-  const [checkingOutTier, setCheckingOutTier] = useState<SubscriptionTier | null>(null)
-  const [error, setError] = useState('')
-
-  const handleSelectPlan = async (tier: SubscriptionTier) => {
-    setCheckingOutTier(tier)
-    setError('')
-    try {
-      await onSelectTier(tier)
-    } catch (err: any) {
-      setError(err.message || 'Nem sikerült aktiválni az előfizetést.')
-    } finally {
-      setCheckingOutTier(null)
-    }
-  }
-
-  return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-slate-950 p-6">
-      <div className="absolute inset-0 overflow-hidden">
-        <div className="absolute left-1/2 top-0 h-px w-3/4 -translate-x-1/2 bg-gradient-to-r from-transparent via-indigo-500/30 to-transparent" />
-        <div className="absolute left-1/2 top-1/3 h-64 w-64 -translate-x-1/2 rounded-full bg-indigo-600/5 blur-3xl" />
-      </div>
-
-      <div className="relative w-full max-w-5xl">
-        <div className="mb-8 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600">
-              <Zap className="h-4 w-4 text-white" />
-            </div>
-            <span className="font-bold text-white">NormaFlow</span>
-          </div>
-          <button
-            type="button"
-            onClick={onLogout}
-            className="flex items-center gap-1.5 text-xs text-slate-500 transition-colors hover:text-slate-300"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-            Kijelentkezés
-          </button>
-        </div>
-
-        <div className="mb-10 text-center">
-          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-indigo-500/20">
-            <Sparkles className="h-7 w-7 text-indigo-400" />
-          </div>
-          <h2 className="text-3xl font-bold text-white">Válasszon csomagot</h2>
-          <p className="mt-2 text-sm text-slate-400">
-            Belépve mint <span className="text-slate-300">{userEmail}</span>
-          </p>
-          <p className="mt-3 text-sm text-slate-500">
-            Az alkalmazás használatához aktív előfizetés szükséges.
-          </p>
-        </div>
-
-        {error && (
-          <div className="mb-6 rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-center text-sm text-red-400">
-            {error}
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
-          {PRICING_PLANS.map((plan) => (
-            <div
-              key={plan.tier}
-              className={`relative flex flex-col rounded-2xl border p-6 shadow-xl transition-all ${
-                plan.highlighted
-                  ? 'border-indigo-500/50 bg-gradient-to-b from-indigo-950/40 to-slate-900 ring-1 ring-indigo-500/30'
-                  : 'border-slate-800 bg-slate-900/80'
-              }`}
-            >
-              {plan.highlighted && (
-                <span className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-indigo-600 px-3 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white">
-                  Népszerű
-                </span>
-              )}
-              <h3 className="text-xl font-bold text-white">{plan.name}</h3>
-              <div className="mt-3 flex items-baseline gap-1">
-                <span className="text-3xl font-bold text-white">{plan.price}</span>
-                <span className="text-sm text-slate-400">Ft / hó</span>
-              </div>
-              <p className="mt-2 text-sm font-medium text-indigo-300">
-                {plan.emails.toLocaleString('hu-HU')} e-mail / hó
-              </p>
-
-              <ul className="mt-6 flex-1 space-y-3">
-                {plan.features.map((feature) => (
-                  <li key={feature} className="flex items-start gap-2.5 text-sm text-slate-300">
-                    <Check className="mt-0.5 h-4 w-4 shrink-0 text-indigo-400" />
-                    {feature}
-                  </li>
-                ))}
-              </ul>
-
-              <button
-                type="button"
-                onClick={() => handleSelectPlan(plan.tier)}
-                disabled={checkingOutTier !== null}
-                className={`mt-6 flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-60 ${
-                  plan.highlighted
-                    ? 'bg-indigo-600 text-white hover:bg-indigo-500 shadow-lg shadow-indigo-900/40'
-                    : 'border border-slate-700 bg-slate-950 text-slate-200 hover:border-indigo-500/50 hover:bg-slate-900'
-                }`}
-              >
-                {checkingOutTier === plan.tier ? (
-                  <>
-                    <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
-                    Aktiválás…
-                  </>
-                ) : (
-                  <>
-                    <CreditCard className="h-4 w-4" />
-                    {plan.name} csomag választása
-                  </>
-                )}
-              </button>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── TaskCard ─────────────────────────────────────────────────────────────────
-
-function TaskCard({
-  task,
-  isCompleting,
-  onComplete,
-  onWriteReply,
-  onRestoreTask,
-}: {
-  task: Task
-  isCompleting: boolean
-  onComplete: (id: string) => void
-  onWriteReply: (task: Task) => void
-  onRestoreTask: (id: string) => void
-}) {
-  const [isExpanded, setIsExpanded] = useState(false)
-  const style = PRIORITY_STYLES[task.priority]
-
-  const getDaysRemaining = (archivedAtStr?: string): number => {
-    if (!archivedAtStr) return 30
-    const archivedDate = new Date(archivedAtStr)
-    const expirationDate = new Date(archivedDate.getTime() + 30 * 24 * 60 * 60 * 1000)
-    const today = new Date()
-    const diffTime = expirationDate.getTime() - today.getTime()
-    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
-    return Math.max(0, Math.min(30, diffDays))
-  }
-
-  return (
-    <article
-      className={`group relative overflow-hidden rounded-xl border bg-slate-900/60 p-5 shadow-lg backdrop-blur-sm transition-all duration-500 ${style.border} ${style.glow} ${
-        isCompleting
-          ? 'pointer-events-none scale-95 opacity-0 -translate-x-4'
-          : 'opacity-100 translate-x-0 hover:bg-slate-900/80'
-      }`}
-    >
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
-          <div className="mb-2 flex flex-wrap items-center gap-2">
-            <span
-              className={`inline-flex items-center rounded-md px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${style.badge}`}
-            >
-              {task.priority === 5 && (
-                <AlertTriangle className="mr-1 h-3 w-3" />
-              )}
-              P{task.priority} · {style.label}
-            </span>
-            <span className="rounded-md bg-slate-800 px-2 py-0.5 text-[10px] font-medium text-slate-400">
-              {task.category}
-            </span>
-            {task.status === 'archived' && (
-              <span className="inline-flex items-center rounded-md bg-rose-500/10 border border-rose-500/20 px-2 py-0.5 text-[10px] font-medium text-rose-400">
-                {getDaysRemaining(task.archivedAt)} nap maradt a törlésig
-              </span>
-            )}
-          </div>
-
-          <h3 className="text-base font-bold leading-snug text-white">
-            {task.summary}
-          </h3>
-
-          <p className="mt-2 text-sm leading-relaxed text-slate-400">
-            <span className="font-medium text-slate-300">Következő lépés: </span>
-            {task.next_step}
-          </p>
-
-          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
-            <span className="flex items-center gap-1.5">
-              <Mail className="h-3 w-3 shrink-0" />
-              {task.sender}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <Clock className="h-3 w-3 shrink-0" />
-              {formatTimestamp(task.received_at)}
-            </span>
-          </div>
-
-          <p className="mt-1.5 truncate text-[11px] text-slate-600">
-            Tárgy: {task.subject}
-          </p>
-
-          {task.source_email && (
-            <div className="mt-2">
-              <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-violet-400 bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 rounded-full">
-                <Mail className="h-2.5 w-2.5 shrink-0" />
-                Fiók: {task.source_email}
-              </span>
-            </div>
-          )}
-
-          {/* AI Response States */}
-          {task.ai_status === 'generating' && (
-            <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-indigo-500/20 bg-indigo-950/20 p-3 animate-pulse">
-              <span className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent" />
-              <span className="text-xs font-medium text-indigo-300">
-                AI válasz generálása folyamatban…
-              </span>
-            </div>
-          )}
-
-          {task.ai_status === 'sent' && task.ai_reply && (
-            <div className="mt-4 rounded-xl border border-indigo-500/30 bg-slate-950/80 p-4 shadow-inner backdrop-blur-sm">
-              <div className="mb-2 flex items-center justify-between">
-                <div className="flex items-center gap-1.5">
-                  <Sparkles className="h-3.5 w-3.5 text-indigo-400" />
-                  <span className="text-xs font-bold uppercase tracking-wider text-indigo-400">
-                    AI Automatikus Válasz kiküldve
-                  </span>
-                </div>
-                <span className="text-[10px] text-slate-500">Mellékletként elküldve</span>
-              </div>
-              <p className="whitespace-pre-line text-xs leading-relaxed text-slate-300 border-t border-slate-800/80 pt-2 mt-2">
-                {task.ai_reply}
-              </p>
-            </div>
-          )}
-
-          {/* Accordion Expand Trigger */}
-          <div className="mt-4 border-t border-slate-800/50 pt-3">
-            <button
-              type="button"
-              onClick={() => setIsExpanded(!isExpanded)}
-              className="inline-flex items-center gap-1 text-xs font-semibold text-indigo-400 hover:text-indigo-300 transition-colors focus:outline-none"
-            >
-              <span>{isExpanded ? 'Részletek elrejtése' : 'Részletek megtekintése'}</span>
-              <svg
-                className={`h-4 w-4 transform transition-transform duration-200 ${isExpanded ? 'rotate-180' : 'rotate-0'}`}
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 9l-7 7-7-7" />
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        {task.status === 'archived' ? (
-          <button
-            type="button"
-            onClick={() => onRestoreTask(task.id)}
-            className="flex h-9 shrink-0 items-center justify-center rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-3 text-xs font-semibold text-indigo-300 transition-all hover:border-indigo-500/50 hover:bg-indigo-500/20 active:scale-95"
-            aria-label="Feladat visszaállítása"
-            title="Visszaállítás"
-          >
-            Visszaállítás
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={() => onComplete(task.id)}
-            disabled={isCompleting}
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-400 transition-all hover:border-emerald-500/50 hover:bg-emerald-500/20 hover:shadow-md hover:shadow-emerald-900/30 active:scale-95 disabled:opacity-50"
-            aria-label="Feladat késznek jelölése"
-            title="Kész"
-          >
-            <Check className="h-5 w-5" />
-          </button>
-        )}
-      </div>
-
-      {/* Accordion Collapsible Panel */}
-      <div
-        className={`transition-all duration-300 ease-in-out overflow-hidden ${
-          isExpanded ? 'max-h-[800px] opacity-100 mt-4 border-t border-slate-800 pt-4' : 'max-h-0 opacity-0'
-        }`}
-      >
-        <div className="space-y-4">
-          {/* AI Summary */}
-          {task.ai_summary ? (
-            <div>
-              <h4 className="text-[10px] font-bold uppercase tracking-wider text-indigo-400 mb-1">AI Feladat Összegzés</h4>
-              <p className="text-xs text-slate-300 bg-slate-950/50 p-3 rounded-lg border border-slate-800/80 whitespace-pre-line leading-relaxed">
-                {task.ai_summary}
-              </p>
-            </div>
-          ) : (
-            <div>
-              <h4 className="text-[10px] font-bold uppercase tracking-wider text-indigo-400 mb-1">AI Feladat Összegzés</h4>
-              <p className="text-xs text-slate-500 italic bg-slate-950/30 p-3 rounded-lg border border-slate-800/30">
-                Nincs AI összegzés ehhez a feladathoz.
-              </p>
-            </div>
-          )}
-
-          {/* Original Message Text Content */}
-          {task.textContent ? (
-            <div>
-              <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Eredeti Üzenet</h4>
-              <pre className="max-h-48 overflow-y-auto text-[11px] text-slate-400 bg-slate-950/70 p-3 rounded-lg border border-slate-800/80 whitespace-pre-wrap font-mono leading-normal shadow-inner">
-                {task.textContent}
-              </pre>
-            </div>
-          ) : (
-            <div>
-              <h4 className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Eredeti Üzenet</h4>
-              <p className="text-xs text-slate-500 italic bg-slate-950/30 p-3 rounded-lg border border-slate-800/30">
-                Nincs elérhető eredeti üzenetszöveg.
-              </p>
-            </div>
-          )}
-
-          {/* Action Area: Write Reply & Complete or Restore */}
-          <div className="flex justify-end gap-2.5 pt-2 border-t border-slate-800/40">
-            {task.status === 'archived' ? (
-              <button
-                type="button"
-                onClick={() => onRestoreTask(task.id)}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 font-semibold text-xs px-4 py-2 transition-all active:scale-95"
-              >
-                <span>Visszaállítás</span>
-              </button>
-            ) : (
-              <>
-                <button
-                  type="button"
-                  onClick={() => onComplete(task.id)}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 font-semibold text-xs px-4 py-2 transition-all active:scale-95"
-                >
-                  <Check className="h-3.5 w-3.5" />
-                  <span>Feladat Elvégzése</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onWriteReply(task)}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs px-4 py-2 shadow-lg transition-all active:scale-95 hover:shadow-indigo-500/20"
-                >
-                  <Mail className="h-3.5 w-3.5" />
-                  <span>Válasz írása</span>
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      </div>
-    </article>
-  )
-}
+// ─── TaskCard (extracted to components/dashboard/TaskCard.tsx) ────────────────────
 
 // ─── MainDashboard ───────────────────────────────────────────────────────────
 
@@ -858,11 +118,6 @@ function MainDashboard({
   onLogout,
   activeTab,
   onTabChange,
-  automationEnabled,
-  promptRules,
-  globalAutomation,
-  exclusionRules,
-  onSaveAutomation,
   onOpenFeedback,
   processedEmailsThisMonth,
   tier,
@@ -881,11 +136,6 @@ function MainDashboard({
   onLogout: () => void
   activeTab: 'tasks' | 'inbox' | 'automation'
   onTabChange: (tab: 'tasks' | 'inbox' | 'automation') => void
-  automationEnabled: boolean
-  promptRules: string
-  globalAutomation: boolean
-  exclusionRules: string
-  onSaveAutomation: (rules: string, enabled: boolean, globalAuto: boolean, exclRules: string) => Promise<void> | void
   onOpenFeedback: () => void
   processedEmailsThisMonth: number
   tier: string
@@ -1417,13 +667,7 @@ function MainDashboard({
             </header>
 
             <main className="flex-1 overflow-y-auto p-4 sm:p-6 bg-slate-950">
-              <AutoResponder
-                initialEnabled={automationEnabled && processedEmailsThisMonth < limit}
-                initialRules={promptRules}
-                initialGlobalAutomation={globalAutomation}
-                initialExclusionRules={exclusionRules}
-                onSave={onSaveAutomation}
-                limitExceeded={processedEmailsThisMonth >= limit}
+              <AiSettings
                 userEmail={userEmail}
                 userId={userId}
               />
@@ -1649,7 +893,7 @@ function WhitelistSettingsCard({
 // ─── App Root ────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [authReady, setAuthReady] = useState(false)
+  const [authReady] = useState(false)
   const [userEmail, setUserEmail] = useState<string | null>(null)
   const [subscriptionStatus, setSubscriptionStatus] = useState<string>('none')
   const [processedEmailsThisMonth, setProcessedEmailsThisMonth] = useState<number>(0)
@@ -1667,125 +911,15 @@ export default function App() {
   const [promptRules, setPromptRules] = useState(
     'Ha az ügyfél számlát kér, válaszolj udvariasan, hogy feldolgozzuk és küldjük. Válasz végére írd oda: Üdvözlettel, NormaFlow Asszisztens.'
   )
-  const [globalAutomation, setGlobalAutomation] = useState(false)
-  const [exclusionRules, setExclusionRules] = useState('')
   const [enforceWhitelist, setEnforceWhitelist] = useState(true)
   
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false)
 
   // Manual Reply states & actions
   const [replyTask, setReplyTask] = useState<Task | null>(null)
-  const [replyRecipient, setReplyRecipient] = useState('')
-  const [replySubject, setReplySubject] = useState('')
-  const [replyBody, setReplyBody] = useState('')
-  const [isImprovingDraft, setIsImprovingDraft] = useState(false)
-  const [isSendingReply, setIsSendingReply] = useState(false)
-  const [replyError, setReplyError] = useState<{ code: string; message: string } | null>(null)
 
   const handleWriteReply = (task: Task) => {
     setReplyTask(task)
-    setReplyRecipient(task.sender)
-    setReplySubject(task.subject.startsWith('Re:') ? task.subject : `Re: ${task.subject}`)
-    setReplyBody(task.ai_reply || '')
-    setReplyError(null)
-  }
-
-  const handleImproveDraft = async () => {
-    if (!replyBody.trim()) return
-    setIsImprovingDraft(true)
-    try {
-      const user = auth.currentUser
-      if (!user) throw new Error('Nem bejelentkezett felhasználó')
-      const token = await user.getIdToken()
-
-      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/improveEmailDraft', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ text: replyBody }),
-      })
-
-      if (!response.ok) {
-        throw new Error('Hiba történt a feljavítás során')
-      }
-
-      const data = await response.json()
-      if (data.text) {
-        setReplyBody(data.text)
-        const toastId = generateId()
-        setToasts((prev) => [
-          ...prev,
-          {
-            id: toastId,
-            message: 'AI Válasz feljavítva!',
-            taskSummary: 'A piszkozat sikeresen finomítva lett.',
-          },
-        ])
-      }
-    } catch (err: any) {
-      console.error(err)
-      alert('Nem sikerült feljavítani a piszkozatot: ' + err.message)
-    } finally {
-      setIsImprovingDraft(false)
-    }
-  }
-
-  const handleSendManualReply = async () => {
-    if (!replyTask) return
-    if (!replyRecipient.trim() || !replySubject.trim() || !replyBody.trim()) {
-      alert('Minden mezőt ki kell tölteni a küldéshez.')
-      return
-    }
-    setIsSendingReply(true)
-    try {
-      const user = auth.currentUser
-      if (!user) throw new Error('Nem bejelentkezett felhasználó')
-      const token = await user.getIdToken()
-
-      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/sendManualEmail', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          taskId: replyTask.id,
-          recipient: replyRecipient,
-          subject: replySubject,
-          body: replyBody,
-        }),
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json()
-        if (errorData.error === 'SMTP_NOT_CONFIGURED') {
-          setReplyError({ code: 'SMTP_NOT_CONFIGURED', message: errorData.message || '' })
-          throw new Error('SMTP_NOT_CONFIGURED')
-        }
-        throw new Error(errorData.message || 'Sikertelen e-mail küldés.')
-      }
-
-      setReplyTask(null)
-
-      const toastId = generateId()
-      setToasts((prev) => [
-        ...prev,
-        {
-          id: toastId,
-          message: 'E-mail elküldve',
-          taskSummary: `Sikeres válasz a következőnek: ${replyRecipient}`,
-        },
-      ])
-    } catch (err: any) {
-      console.error(err)
-      if (err.message !== 'SMTP_NOT_CONFIGURED') {
-        alert('Hiba az e-mail küldése során: ' + err.message)
-      }
-    } finally {
-      setIsSendingReply(false)
-    }
   }
 
   // Use refs to avoid resetting the simulation interval when rules change
@@ -1799,39 +933,6 @@ export default function App() {
   useEffect(() => {
     promptRulesRef.current = promptRules
   }, [promptRules])
-
-  // Listen for Auth changes
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (user) {
-        setUserEmail(user.email)
-        if (user.email) {
-          try {
-            const userRef = doc(db, 'users', user.email)
-            // Save uid to the user's document for mapping in webhooks
-            await setDoc(userRef, { uid: user.uid }, { merge: true })
-            const docSnap = await getDoc(userRef)
-            if (docSnap.exists()) {
-              const data = docSnap.data()
-              setSubscriptionStatus(data?.subscriptionStatus ?? 'none')
-              setTier(data?.tier ?? 'none')
-            } else {
-              setSubscriptionStatus('none')
-              setTier('none')
-            }
-          } catch (error) {
-            console.error('Error fetching initial user doc:', error)
-          }
-        }
-      } else {
-        setUserEmail(null)
-        setSubscriptionStatus('none')
-        setTier('none')
-      }
-      setAuthReady(true)
-    })
-    return () => unsubscribe()
-  }, [])
 
   // Listen for user subscriptionStatus in Firestore in real time
   useEffect(() => {
@@ -1880,6 +981,7 @@ export default function App() {
     setToasts([])
     setActiveTab('tasks')
     setAutomationEnabled(false)
+    setEnforceWhitelist(true)
   }
 
   const handleSelectTier = async (selectedTier: SubscriptionTier) => {
@@ -1899,7 +1001,7 @@ export default function App() {
       if (!user) throw new Error('Nem bejelentkezett felhasználó')
       const token = await user.getIdToken()
 
-      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/archiveTask', {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/archiveTask`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1941,7 +1043,7 @@ export default function App() {
       if (!user) throw new Error('Nem bejelentkezett felhasználó')
       const token = await user.getIdToken()
 
-      const response = await fetch('https://api-cdaanjspxq-uc.a.run.app/restoreTask', {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/restoreTask`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1967,47 +1069,6 @@ export default function App() {
     } catch (err: any) {
       console.error('Error restoring task:', err)
       alert('Hiba a visszaállítás során: ' + err.message)
-    }
-  }
-
-  const handleSaveAutomation = async (rules: string, enabled: boolean, globalAuto: boolean, exclRules: string) => {
-    if (!userEmail) return
-    try {
-      const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
-      await setDoc(settingsRef, {
-        automationEnabled: enabled,
-        promptRules: rules,
-        globalAutomation: globalAuto,
-        globalAutomationEnabled: globalAuto,
-        exclusionRules: exclRules
-      }, { merge: true })
-
-      setPromptRules(rules)
-      setAutomationEnabled(enabled)
-      setGlobalAutomation(globalAuto)
-      setExclusionRules(exclRules)
-      
-      // Trigger notification
-      const toastId = generateId()
-      setToasts((prev) => [
-        ...prev,
-        {
-          id: toastId,
-          message: 'Beállítások mentve',
-          taskSummary: enabled ? 'AI Auto-Responder aktív' : 'AI Auto-Responder inaktív',
-        },
-      ])
-    } catch (err) {
-      console.error('Error saving automation settings:', err)
-      const toastId = generateId()
-      setToasts((prev) => [
-        ...prev,
-        {
-          id: toastId,
-          message: 'Mentési hiba',
-          taskSummary: 'Nem sikerült elmenteni a beállításokat.',
-        },
-      ])
     }
   }
 
@@ -2140,10 +1201,6 @@ export default function App() {
           if (data.promptRules) {
             setPromptRules(data.promptRules)
           }
-          setGlobalAutomation(!!data.globalAutomation || !!data.globalAutomationEnabled)
-          if (data.exclusionRules) {
-            setExclusionRules(data.exclusionRules)
-          }
           setEnforceWhitelist(data.enforceWhitelist !== false)
         }
       } catch (err) {
@@ -2186,11 +1243,6 @@ export default function App() {
           onLogout={handleLogout}
           activeTab={activeTab}
           onTabChange={setActiveTab}
-          automationEnabled={automationEnabled}
-          promptRules={promptRules}
-          globalAutomation={globalAutomation}
-          exclusionRules={exclusionRules}
-          onSaveAutomation={handleSaveAutomation}
           onOpenFeedback={() => setIsFeedbackOpen(true)}
           processedEmailsThisMonth={processedEmailsThisMonth}
           tier={tier}
@@ -2211,138 +1263,24 @@ export default function App() {
 
       {/* Manual Reply Modal */}
       {replyTask && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-2xl overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/90 shadow-2xl backdrop-blur-md transition-all duration-300">
-            {/* Modal Header */}
-            <div className="flex flex-col border-b border-slate-800 px-6 py-4 gap-1 bg-slate-900/40">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Mail className="h-5 w-5 text-indigo-400" />
-                  <h3 className="text-base font-bold text-white">Manuális válasz küldése</h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setReplyTask(null)}
-                  className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200 transition-colors"
-                >
-                  <X className="h-5 w-5" />
-                </button>
-              </div>
-              <div className="flex items-center mt-1">
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 px-2.5 py-0.5 text-xs font-medium text-indigo-300">
-                  Küldő fiók: <span className="font-mono text-white">{replyTask.source_mailbox || replyTask.source_email || userEmail || ''}</span>
-                </span>
-              </div>
-            </div>
-
-            {/* Modal Body */}
-            <div className="space-y-4 p-6">
-              {replyError?.code === 'SMTP_NOT_CONFIGURED' && (
-                <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-4 text-xs text-red-400 animate-fade-in">
-                  <div className="flex items-start gap-2.5">
-                    <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
-                    <div className="space-y-2">
-                      <p className="font-medium leading-normal">
-                        Nem tudunk levelet küldeni a(z) <strong className="text-white font-mono">{replyTask.source_mailbox || replyTask.source_email || ''}</strong> címről, mert még nem kapcsolta össze az SMTP kimenő szervert az AI Automatizáció menüpontban.
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setReplyTask(null)
-                          setActiveTab('automation')
-                        }}
-                        className="inline-flex items-center gap-1 font-bold underline hover:text-red-300 transition-colors"
-                      >
-                        <span>Ugrás az SMTP Beállításokhoz &rarr;</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div>
-                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">Címzett</label>
-                <input
-                  type="email"
-                  value={replyRecipient}
-                  onChange={(e) => setReplyRecipient(e.target.value)}
-                  className="mt-1.5 w-full rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-sm text-slate-200 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  placeholder="ugyfel@ceg.hu"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">Tárgy</label>
-                <input
-                  type="text"
-                  value={replySubject}
-                  onChange={(e) => setReplySubject(e.target.value)}
-                  className="mt-1.5 w-full rounded-xl border border-slate-800 bg-slate-950/50 p-3 text-sm text-slate-200 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                  placeholder="Válasz"
-                />
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400">Válaszüzenet</label>
-                  
-                  <button
-                    type="button"
-                    onClick={handleImproveDraft}
-                    disabled={isImprovingDraft || !replyBody.trim()}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 font-semibold text-xs px-2.5 py-1.5 shadow transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none"
-                  >
-                    {isImprovingDraft ? (
-                      <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent" />
-                    ) : (
-                      <Sparkles className="h-3.5 w-3.5 text-indigo-400 animate-pulse" />
-                    )}
-                    <span>AI Válasz Feljavítása</span>
-                  </button>
-                </div>
-                
-                <textarea
-                  value={replyBody}
-                  onChange={(e) => setReplyBody(e.target.value)}
-                  rows={8}
-                  className="w-full rounded-xl border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-200 shadow-inner focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none leading-relaxed"
-                  placeholder="Írja ide a válaszát..."
-                />
-              </div>
-            </div>
-
-            {/* Modal Footer */}
-            <div className="flex items-center justify-end gap-3 border-t border-slate-800 px-6 py-4 bg-slate-950/40">
-              <button
-                type="button"
-                onClick={() => setReplyTask(null)}
-                disabled={isSendingReply}
-                className="rounded-xl border border-slate-800 bg-slate-900/60 hover:bg-slate-800 px-5 py-2.5 text-xs font-semibold text-slate-300 transition-all active:scale-95 disabled:opacity-50"
-              >
-                Mégse
-              </button>
-              
-              <button
-                type="button"
-                onClick={handleSendManualReply}
-                disabled={isSendingReply || !replyBody.trim() || !replyRecipient.trim() || !replySubject.trim()}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs px-5 py-2.5 shadow-lg transition-all active:scale-95 disabled:opacity-50"
-              >
-                {isSendingReply ? (
-                  <>
-                    <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                    <span>Küldés folyamatban…</span>
-                  </>
-                ) : (
-                  <>
-                    <Check className="h-4 w-4" />
-                    <span>Küldés</span>
-                  </>
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
+        <ManualReplyModal
+          replyTask={replyTask}
+          userEmail={userEmail || ''}
+          onClose={() => setReplyTask(null)}
+          onReplySent={() => {
+            setReplyTask(null)
+            setToasts((prev) => [
+              ...prev,
+              {
+                id: `toast-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+                message: 'E-mail elküldve',
+                taskSummary: `Sikeres válasz a következőnek: ${replyTask.sender}`,
+              },
+            ])
+          }}
+          onNavigateToAutomation={() => setActiveTab('automation')}
+          onToastAdd={(toast) => setToasts((prev) => [...prev, toast])}
+        />
       )}
 
       {/* Toast Stack */}

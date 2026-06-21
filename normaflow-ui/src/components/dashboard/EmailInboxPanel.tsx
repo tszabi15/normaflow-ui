@@ -71,7 +71,7 @@ export default function EmailInboxPanel({ userId }: EmailInboxPanelProps) {
 
     try {
       const token = await auth.currentUser?.getIdToken(true)
-      const res = await fetch('https://api-cdaanjspxq-uc.a.run.app/processEmailWithAi', {
+      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/processEmailWithAi`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -110,7 +110,7 @@ export default function EmailInboxPanel({ userId }: EmailInboxPanelProps) {
 
     try {
       const token = await auth.currentUser?.getIdToken(true)
-      const res = await fetch(`https://api-cdaanjspxq-uc.a.run.app/emails/${emailId}`, {
+      const res = await fetch(`${import.meta.env.VITE_API_BASE_URL}/emails/${emailId}`, {
         method: 'DELETE',
         headers: {
           'Content-Type': 'application/json',

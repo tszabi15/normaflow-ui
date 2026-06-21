@@ -8,6 +8,7 @@ import { OpenAI } from "openai";
 import * as nodemailer from "nodemailer";
 import express from "express";
 import cors from "cors";
+import * as crypto from "crypto";
 
 // Set global options for the functions (max instances for budget/cost control)
 setGlobalOptions({ maxInstances: 10 });
@@ -39,6 +40,12 @@ interface SendAiReplyRequest {
   recipientEmail: string;
 }
 
+interface UserQuota {
+  tier: 'none' | 'basic' | 'pro' | 'ultra';
+  processedEmailsThisMonth: number;
+  subscriptionStatus: string;
+}
+
 
 /** Extract and verify JWT from Authorization header */
 async function verifyAuthToken(req: any): Promise<{ email: string; uid: string } | null> {
@@ -53,34 +60,129 @@ async function verifyAuthToken(req: any): Promise<{ email: string; uid: string }
   }
 }
 
+/** Verify webhook secret token from GAS router */
+async function verifyWebhookToken(req: any): Promise<boolean> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return false;
+  const token = authHeader.split("Bearer ")[1];
+  const serverKey = process.env.SERVER_WEBHOOK_KEY;
+  if (!serverKey) {
+    logger.error("SERVER_WEBHOOK_KEY not configured");
+    return false;
+  }
+  return token === serverKey;
+}
+
+/** AES-256-GCM encryption for SMTP passwords */
+const ALGORITHM = 'aes-256-gcm';
+const IV_LENGTH = 16;
+const SALT_LENGTH = 32;
+const TAG_LENGTH = 16;
+const TAG_POSITION = SALT_LENGTH + IV_LENGTH;
+const ENCRYPTED_POSITION = TAG_POSITION + TAG_LENGTH;
+
+function getKey(salt: Buffer): Buffer {
+  return crypto.pbkdf2Sync(process.env.ENCRYPTION_KEY || '', salt, 100000, 32, 'sha256');
+}
+
+export function encrypt(text: string): string {
+  const iv = crypto.randomBytes(IV_LENGTH);
+  const salt = crypto.randomBytes(SALT_LENGTH);
+  const key = getKey(salt);
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([salt, iv, tag, Buffer.from(encrypted, 'hex')]).toString('base64');
+}
+
+export function decrypt(encryptedData: string): string {
+  const buffer = Buffer.from(encryptedData, 'base64');
+  const salt = buffer.subarray(0, SALT_LENGTH);
+  const iv = buffer.subarray(SALT_LENGTH, TAG_POSITION);
+  const tag = buffer.subarray(TAG_POSITION, ENCRYPTED_POSITION);
+  const encrypted = buffer.subarray(ENCRYPTED_POSITION);
+  const key = getKey(salt);
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+  decipher.setAuthTag(tag);
+  let decrypted = decipher.update(encrypted);
+  decrypted = Buffer.concat([decrypted, decipher.final()]);
+  return decrypted.toString('utf8');
+}
+
 /** Check if a user has an active subscription */
 async function checkSubscription(userEmail: string): Promise<boolean> {
   const userDoc = await db.collection("users").doc(userEmail).get();
   return userDoc.exists && userDoc.data()?.subscriptionStatus === "active";
 }
 
+/** Get user quota information for tier enforcement */
+async function getUserQuota(userId: string): Promise<UserQuota | null> {
+  try {
+    const userQuery = await db.collection("users").where("uid", "==", userId).limit(1).get();
+    if (userQuery.empty) return null;
+    const userDoc = userQuery.docs[0];
+    const data = userDoc.data();
+    return {
+      tier: data?.tier || 'none',
+      processedEmailsThisMonth: data?.processedEmailsThisMonth || 0,
+      subscriptionStatus: data?.subscriptionStatus || 'none'
+    };
+  } catch (err) {
+    logger.error("Failed to fetch user quota:", err);
+    return null;
+  }
+}
+
+/** Check if user has exceeded their tier limit */
+function hasExceededQuota(quota: UserQuota): boolean {
+  const TIER_LIMITS: Record<string, number> = {
+    none: 0,
+    basic: 500,
+    pro: 1500,
+    ultra: 5000
+  };
+  const limit = TIER_LIMITS[quota.tier] || 0;
+  return quota.processedEmailsThisMonth >= limit;
+}
+
 async function resolveSmtpConfig(userEmail: string, preferredEmail?: string): Promise<EmailConfig | null> {
+  let config: EmailConfig | null = null;
+  
   if (preferredEmail) {
     const connSnap = await db.collection("users").doc(userEmail).collection("email_connections")
       .where("email", "==", preferredEmail)
       .limit(1)
       .get();
     if (!connSnap.empty) {
-      return connSnap.docs[0].data() as EmailConfig;
+      config = connSnap.docs[0].data() as EmailConfig;
     }
   }
 
-  const connsSnap = await db.collection("users").doc(userEmail).collection("email_connections").limit(1).get();
-  if (!connsSnap.empty) {
-    return connsSnap.docs[0].data() as EmailConfig;
+  if (!config) {
+    const connsSnap = await db.collection("users").doc(userEmail).collection("email_connections").limit(1).get();
+    if (!connsSnap.empty) {
+      config = connsSnap.docs[0].data() as EmailConfig;
+    }
   }
 
-  const legacyDoc = await db.doc(`users/${userEmail}/tokens/email_config`).get();
-  if (legacyDoc.exists) {
-    return legacyDoc.data() as EmailConfig;
+  if (!config) {
+    const legacyDoc = await db.doc(`users/${userEmail}/tokens/email_config`).get();
+    if (legacyDoc.exists) {
+      config = legacyDoc.data() as EmailConfig;
+    }
   }
 
-  return null;
+  if (config && config.password) {
+    try {
+      config.password = decrypt(config.password);
+    } catch (err) {
+      logger.error("Failed to decrypt SMTP password:", err);
+      return null;
+    }
+  }
+
+  return config;
 }
 
 /**
@@ -93,6 +195,13 @@ const handleIncomingEmailLogic: express.RequestHandler = async (req, res) => {
     if (req.method !== "POST") {
       logger.warn(`Method Not Allowed: ${req.method}`);
       res.status(405).json({ error: "Method Not Allowed" });
+      return;
+    }
+
+    // Webhook authentication - prevent spoofing and denial of wallet
+    if (!(await verifyWebhookToken(req))) {
+      logger.warn("handleIncomingEmail: Unauthorized webhook request");
+      res.status(401).json({ error: "Unauthorized" });
       return;
     }
 
@@ -137,13 +246,15 @@ const handleIncomingEmailLogic: express.RequestHandler = async (req, res) => {
 
     // Autonomous Trigger Hook
     try {
-      const autoDoc = await db.doc(`users/${userEmail}/settings/auto_responder`).get();
-      if (autoDoc.exists && autoDoc.data()?.globalAutomationEnabled === true) {
-        logger.info(`handleIncomingEmailLogic: Auto-processing email ${emailDocRef.id} for ${userEmail}`);
+      const aiConfigDoc = await db.doc(`users/${extractedUid}/settings/ai_configuration`).get();
+      if (aiConfigDoc.exists && aiConfigDoc.data()?.globalAutomationEnabled === true) {
+        logger.info(`handleIncomingEmailLogic: Auto-processing email ${emailDocRef.id} for user UID ${extractedUid}`);
         await processEmailInternally(emailDocRef.id, userEmail);
+      } else {
+        logger.info(`handleIncomingEmailLogic: Automation disabled for user UID ${extractedUid}, email saved without AI processing (zero credits consumed)`);
       }
     } catch (autoErr) {
-      logger.error(`handleIncomingEmailLogic: Autonomous processing failed for email ${emailDocRef.id}:`, autoErr);
+      logger.error(`handleIncomingEmailLogic: Autonomous processing check failed for email ${emailDocRef.id}:`, autoErr);
     }
 
     res.status(200).json({
@@ -721,8 +832,7 @@ async function processEmailInternally(emailId: string, userEmail: string): Promi
 
   const emailData = emailDoc.data()!;
 
-  // Load auto-responder rules for the user
-  // Load user-defined custom AI rules from users/{userId}/settings/ai_rules
+  // Load unified AI configuration from users/{userId}/settings/ai_configuration
   let userId = emailData.user_id || "";
   if (!userId) {
     const userQuery = await db.collection("users").where("email", "==", userEmail).limit(1).get();
@@ -733,26 +843,32 @@ async function processEmailInternally(emailId: string, userEmail: string): Promi
 
   let customPriorityRules = "";
   let customReplyRules = "";
+  let exclusionRules = "";
   if (userId) {
-    const aiRulesDoc = await db.doc(`users/${userId}/settings/ai_rules`).get();
-    if (aiRulesDoc.exists) {
-      const data = aiRulesDoc.data();
+    const aiConfigDoc = await db.doc(`users/${userId}/settings/ai_configuration`).get();
+    if (aiConfigDoc.exists) {
+      const data = aiConfigDoc.data();
       customPriorityRules = data?.customPriorityRules || "";
       customReplyRules = data?.customReplyRules || "";
+      exclusionRules = data?.exclusionRules || "";
     }
-  }
-
-  // Load auto-responder rules for the user (for pre-filtering exclusions)
-  const rulesDoc = await db.doc(`users/${userEmail}/settings/auto_responder`).get();
-  let exclusionRules = "";
-  if (rulesDoc.exists) {
-    const rulesData = rulesDoc.data();
-    exclusionRules = rulesData?.exclusionRules || "";
   }
 
   const sender = emailData.sender || "";
   const subject = emailData.subject || "Nincs tárgy";
   const textContent = emailData.textContent || "";
+
+  // Quota verification before OpenAI API calls - prevent unnecessary billing
+  const userQuota = await getUserQuota(userId);
+  if (!userQuota) {
+    logger.error(`processEmailInternally: Failed to fetch quota for user ${userId}`);
+    return { status: "quota_error" };
+  }
+  if (hasExceededQuota(userQuota)) {
+    logger.warn(`processEmailInternally: User ${userId} has exceeded tier limit (${userQuota.tier}: ${userQuota.processedEmailsThisMonth})`);
+    await emailRef.update({ status: "quota_exceeded" });
+    return { status: "quota_exceeded", reason: "Tier limit exceeded" };
+  }
 
   if (!process.env.OPENAI_API_KEY) {
     logger.warn("processEmailInternally: OPENAI_API_KEY not set, skipping AI processing.");
@@ -784,7 +900,14 @@ A választ szigorúan JSON formátumban add vissza:
         response_format: { type: "json_object" },
         max_tokens: 200,
       });
-      const filterResult = JSON.parse(filterResponse.choices[0]?.message?.content || "{}");
+      let filterResult: any;
+      try {
+        filterResult = JSON.parse(filterResponse.choices[0]?.message?.content || "{}");
+      } catch (parseErr) {
+        logger.error(`processEmailInternally: Failed to parse filter JSON for ${userEmail}:`, parseErr);
+        // On parse error, proceed to task generation anyway
+        filterResult = { relevant: true, reason: "Parse error, proceeding with processing" };
+      }
 
       if (filterResult.relevant === false) {
         await emailRef.update({
@@ -816,11 +939,11 @@ Baseline Priority Logic (Unless overridden by the user's custom priority rules):
 
 ---
 [USER-DEFINED CUSTOM PRIORITIZATION INSTRUCTIONS]
-${customPriorityRules.trim() || "No custom priority rules provided by the user. Rely purely on the baseline logic."}
+${customPriorityRules.trim() || "No custom priority rules provided. Rely purely on the baseline logic."}
 
 ---
 [USER-DEFINED CUSTOM REPLY DRAFTING INSTRUCTIONS]
-${customReplyRules.trim() || "No custom reply rules provided by the user. Draft a formal, professional response in Hungarian."}`;
+${customReplyRules.trim() || "No custom reply rules provided. Draft a formal, professional response in Hungarian."}`;
 
     const userPrompt = `[ORIGINAL EMAIL DATA TO PROCESS]
 Feladó: ${sender}
@@ -838,7 +961,20 @@ ${textContent}`;
       response_format: { type: "json_object" },
       max_tokens: 1000,
     });
-    const result = JSON.parse(response.choices[0]?.message?.content || "{}");
+    let result: any;
+    try {
+      result = JSON.parse(response.choices[0]?.message?.content || "{}");
+    } catch (parseErr) {
+      logger.error(`processEmailInternally: Failed to parse task generation JSON for ${userEmail}:`, parseErr);
+      // Fallback to default manual review task on parse error
+      result = {
+        summary: subject || "E-mail feldolgozása",
+        action_items: "Manuális felülvizsgálat szükséges",
+        priority: "Közepes",
+        priority_reason: "AI parse error, requires manual review",
+        reply_draft: null
+      };
+    }
 
     const baseSummary = result.summary || "Nem sikerült összefoglalót készíteni.";
     const actionItems = result.action_items || "";
@@ -864,6 +1000,11 @@ ${textContent}`;
     aiReplyDraft = result.reply_draft || null;
   } catch (aiErr) {
     logger.error(`processEmailInternally: AI task generation error for ${userEmail}:`, aiErr);
+    // Fallback to default manual review task on AI error
+    aiSummary = `${subject || "E-mail feldolgozása"}\n\nManuális felülvizsgálat szükséges (AI hiba)`;
+    aiPriorityReason = "AI processing error, requires manual review";
+    priorityNum = 3;
+    aiReplyDraft = null;
   }
 
   // Create task in the tasks collection
