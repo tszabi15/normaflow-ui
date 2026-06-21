@@ -17,13 +17,13 @@ import {
   ShieldAlert,
   Trash2,
   Plus,
-  Copy,
 } from 'lucide-react'
 
 // Import components and types
 import type { Task, TaskCategory, TaskPriority } from './types/task'
 import AutoResponder from './components/dashboard/AutoResponder'
 import FeedbackModal from './components/dashboard/FeedbackModal'
+import EmailInboxPanel from './components/dashboard/EmailInboxPanel'
 import { db, auth } from './firebase'
 import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc } from 'firebase/firestore'
 import {
@@ -204,17 +204,20 @@ function ToastNotification({
   )
 }
 
-async function ensureUserDocument(email: string): Promise<void> {
+async function ensureUserDocument(email: string, uid?: string): Promise<void> {
   const userRef = doc(db, 'users', email)
   const snap = await getDoc(userRef)
   if (!snap.exists()) {
     await setDoc(userRef, {
       email,
+      uid: uid || '',
       subscriptionStatus: 'none',
       tier: 'none',
       processedEmailsThisMonth: 0,
       createdAt: new Date().toISOString(),
     })
+  } else if (uid) {
+    await setDoc(userRef, { uid }, { merge: true })
   }
 }
 
@@ -227,8 +230,8 @@ function LoginView({ onAuthenticated }: { onAuthenticated: () => void }) {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
 
-  const completeSignIn = async (signedInEmail: string) => {
-    await ensureUserDocument(signedInEmail)
+  const completeSignIn = async (signedInEmail: string, uid?: string) => {
+    await ensureUserDocument(signedInEmail, uid)
     onAuthenticated()
   }
 
@@ -240,11 +243,11 @@ function LoginView({ onAuthenticated }: { onAuthenticated: () => void }) {
     try {
       if (isSignUp) {
         const userCredential = await createUserWithEmailAndPassword(auth, email, password)
-        await ensureUserDocument(userCredential.user.email || email)
+        await ensureUserDocument(userCredential.user.email || email, userCredential.user.uid)
         onAuthenticated()
       } else {
         const userCredential = await signInWithEmailAndPassword(auth, email, password)
-        await completeSignIn(userCredential.user.email || email)
+        await completeSignIn(userCredential.user.email || email, userCredential.user.uid)
       }
     } catch (err: any) {
       let errMsg = err.message
@@ -267,7 +270,7 @@ function LoginView({ onAuthenticated }: { onAuthenticated: () => void }) {
     try {
       const provider = new GoogleAuthProvider()
       const result = await signInWithPopup(auth, provider)
-      await ensureUserDocument(result.user.email || '')
+      await ensureUserDocument(result.user.email || '', result.user.uid)
       onAuthenticated()
     } catch (err: any) {
       if (err.code === 'auth/popup-closed-by-user') {
@@ -846,6 +849,7 @@ function TaskCard({
 
 function MainDashboard({
   userEmail,
+  userId,
   tasks,
   categoryFilter,
   onCategoryChange,
@@ -856,6 +860,8 @@ function MainDashboard({
   onTabChange,
   automationEnabled,
   promptRules,
+  globalAutomation,
+  exclusionRules,
   onSaveAutomation,
   onOpenFeedback,
   processedEmailsThisMonth,
@@ -866,17 +872,20 @@ function MainDashboard({
   onRestoreTask,
 }: {
   userEmail: string
+  userId: string
   tasks: Task[]
   categoryFilter: CategoryFilter
   onCategoryChange: (cat: CategoryFilter) => void
   completingIds: Set<string>
   onCompleteTask: (id: string) => void
   onLogout: () => void
-  activeTab: 'tasks' | 'automation'
-  onTabChange: (tab: 'tasks' | 'automation') => void
+  activeTab: 'tasks' | 'inbox' | 'automation'
+  onTabChange: (tab: 'tasks' | 'inbox' | 'automation') => void
   automationEnabled: boolean
   promptRules: string
-  onSaveAutomation: (rules: string, enabled: boolean) => Promise<void> | void
+  globalAutomation: boolean
+  exclusionRules: string
+  onSaveAutomation: (rules: string, enabled: boolean, globalAuto: boolean, exclRules: string) => Promise<void> | void
   onOpenFeedback: () => void
   processedEmailsThisMonth: number
   tier: string
@@ -996,6 +1005,18 @@ function MainDashboard({
             >
               <Inbox className="h-4 w-4" />
               <span>Feladatok</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onTabChange('inbox')}
+              className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm transition-all ${
+                activeTab === 'inbox'
+                  ? 'bg-indigo-600/20 font-medium text-indigo-300'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+              }`}
+            >
+              <Mail className="h-4 w-4" />
+              <span>Bejövő levelek</span>
             </button>
             <button
               type="button"
@@ -1137,14 +1158,27 @@ function MainDashboard({
                     <button
                       type="button"
                       onClick={() => onTabChange('tasks')}
-                      className="rounded-md px-2.5 py-1.5 text-xs font-medium transition-all bg-indigo-600 text-white"
+                      className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                        activeTab === 'tasks' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
                     >
                       Feladatok
                     </button>
                     <button
                       type="button"
+                      onClick={() => onTabChange('inbox')}
+                      className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                        (activeTab as string) === 'inbox' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Levelek
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => onTabChange('automation')}
-                      className="rounded-md px-2.5 py-1.5 text-xs font-medium transition-all text-slate-400 hover:text-slate-200"
+                      className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                        (activeTab as string) === 'automation' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
                     >
                       AI
                     </button>
@@ -1288,6 +1322,55 @@ function MainDashboard({
               )}
             </main>
           </>
+        ) : activeTab === 'inbox' ? (
+          <>
+            {/* Top Header for Inbox */}
+            <header className="border-b border-slate-800 bg-slate-900/80 px-4 py-4 backdrop-blur-sm sm:px-6">
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h1 className="text-lg font-bold text-white">Bejövő levelek</h1>
+                  <p className="text-xs text-slate-500">
+                    A szerverre érkező és AI által feldolgozásra váró e-mailek listája
+                  </p>
+                </div>
+
+                {/* Mobile Tab Switcher */}
+                <div className="flex items-center gap-1 rounded-lg bg-slate-950 p-1 border border-slate-800/80 lg:hidden">
+                  <button
+                    type="button"
+                    onClick={() => onTabChange('tasks')}
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                      (activeTab as string) === 'tasks' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Feladatok
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onTabChange('inbox')}
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                      activeTab === 'inbox' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Levelek
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onTabChange('automation')}
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                      (activeTab as string) === 'automation' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    AI
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            <main className="flex-1 overflow-y-auto bg-slate-950">
+              <EmailInboxPanel userId={userId} />
+            </main>
+          </>
         ) : (
           <>
             {/* Top Header for Auto-Responder */}
@@ -1305,14 +1388,27 @@ function MainDashboard({
                   <button
                     type="button"
                     onClick={() => onTabChange('tasks')}
-                    className="rounded-md px-2.5 py-1.5 text-xs font-medium transition-all text-slate-400 hover:text-slate-200"
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                      (activeTab as string) === 'tasks' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                    }`}
                   >
                     Feladatok
                   </button>
                   <button
                     type="button"
+                    onClick={() => onTabChange('inbox')}
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                      (activeTab as string) === 'inbox' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Levelek
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => onTabChange('automation')}
-                    className="rounded-md px-2.5 py-1.5 text-xs font-medium transition-all bg-indigo-600 text-white"
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-all ${
+                      activeTab === 'automation' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                    }`}
                   >
                     AI
                   </button>
@@ -1324,8 +1420,12 @@ function MainDashboard({
               <AutoResponder
                 initialEnabled={automationEnabled && processedEmailsThisMonth < limit}
                 initialRules={promptRules}
+                initialGlobalAutomation={globalAutomation}
+                initialExclusionRules={exclusionRules}
                 onSave={onSaveAutomation}
                 limitExceeded={processedEmailsThisMonth >= limit}
+                userEmail={userEmail}
+                userId={userId}
               />
               <div className="mx-auto max-w-3xl px-4 pb-12 sm:px-6 space-y-6">
                 <WhitelistSettingsCard
@@ -1333,7 +1433,6 @@ function MainDashboard({
                   enforceWhitelist={enforceWhitelist}
                   onToggleWhitelist={onToggleWhitelist}
                 />
-                <EmailConfigCard userEmail={userEmail} />
               </div>
             </main>
           </>
@@ -1543,595 +1642,7 @@ function WhitelistSettingsCard({
   )
 }
 
-// ─── EmailConfigCard ─────────────────────────────────────────────────────────
 
-type EmailProvider = 'google' | 'gmail' | 'outlook' | 'custom'
-
-interface EmailConnection {
-  id: string
-  provider: EmailProvider
-  connection_type: 'direct' | 'forwarder'
-  email: string
-  imapHost?: string
-  imapPort?: number | string
-  smtpHost?: string
-  smtpPort?: number | string
-  connected_at?: string
-}
-
-function EmailConfigCard({ userEmail }: { userEmail: string }) {
-  const [connections, setConnections] = useState<EmailConnection[]>([])
-  const [isAddOpen, setIsAddOpen] = useState(false)
-  const [provider, setProvider] = useState<EmailProvider>('gmail')
-  const [connectionType, setConnectionType] = useState<'direct' | 'forwarder'>('direct')
-  const [showForwarderSmtp, setShowForwarderSmtp] = useState(false)
-  const [configEmail, setConfigEmail] = useState('')
-  const [configPassword, setConfigPassword] = useState('')
-  const [imapHost, setImapHost] = useState('')
-  const [imapPort, setImapPort] = useState('993')
-  const [smtpHost, setSmtpHost] = useState('')
-  const [smtpPort, setSmtpPort] = useState('587')
-  const [isLoading, setIsLoading] = useState(false)
-  const [isSyncing, setIsSyncing] = useState(false)
-  const [error, setError] = useState('')
-  const [success, setSuccess] = useState('')
-  const [copied, setCopied] = useState(false)
-
-  // Load email connections in real-time
-  useEffect(() => {
-    const q = collection(db, `users/${userEmail}/email_connections`)
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const list: EmailConnection[] = []
-      snapshot.forEach((docSnap) => {
-        list.push({
-          id: docSnap.id,
-          ...docSnap.data()
-        } as EmailConnection)
-      })
-      setConnections(list)
-    }, (err) => {
-      console.error('Error loading email connections:', err)
-    })
-    return () => unsubscribe()
-  }, [userEmail])
-
-  // Pre-fill servers when provider changes
-  const handleProviderChange = (p: EmailProvider) => {
-    setProvider(p)
-    setError('')
-    setSuccess('')
-    if (p === 'gmail' || p === 'google') {
-      setImapHost('imap.gmail.com')
-      setImapPort('993')
-      setSmtpHost('smtp.gmail.com')
-      setSmtpPort('465')
-    } else if (p === 'outlook') {
-      setImapHost('outlook.office365.com')
-      setImapPort('993')
-      setSmtpHost('smtp.office365.com')
-      setSmtpPort('587')
-    } else if (p === 'custom') {
-      setImapHost('')
-      setImapPort('993')
-      setSmtpHost('')
-      setSmtpPort('587')
-    }
-  }
-
-  const handleAddConnection = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setIsLoading(true)
-    setError('')
-    setSuccess('')
-    try {
-      const payload: Record<string, any> = {
-        provider,
-        connection_type: connectionType,
-        email: configEmail.trim(),
-        connected_at: new Date().toISOString(),
-      }
-      if (connectionType === 'direct') {
-        payload.password = configPassword
-        payload.imapHost = imapHost.trim()
-        payload.imapPort = parseInt(imapPort) || 993
-        payload.smtpHost = smtpHost.trim()
-        payload.smtpPort = parseInt(smtpPort) || 587
-      } else {
-        // Forwarder mode: SMTP is optional
-        if (configPassword.trim() && smtpHost.trim()) {
-          payload.password = configPassword.trim()
-          payload.smtpHost = smtpHost.trim()
-          payload.smtpPort = parseInt(smtpPort) || 587
-        }
-      }
-
-      const colRef = collection(db, `users/${userEmail}/email_connections`)
-      await addDoc(colRef, payload)
-      setSuccess('E-mail fiók sikeresen összekapcsolva!')
-      setIsAddOpen(false)
-      // Reset form
-      setConfigEmail('')
-      setConfigPassword('')
-      setImapHost('')
-      setImapPort('993')
-      setSmtpHost('')
-      setSmtpPort('587')
-    } catch (err: any) {
-      setError(err.message || 'Hiba történt a kapcsolódás során.')
-    } finally {
-      setIsLoading(false)
-    }
-  }
-
-  const handleDeleteConnection = async (id: string) => {
-    if (!window.confirm('Biztosan törölni szeretné ezt a fiókot és megszakítani a szinkronizációt?')) {
-      return
-    }
-    setError('')
-    setSuccess('')
-    try {
-      const docRef = doc(db, `users/${userEmail}/email_connections`, id)
-      await deleteDoc(docRef)
-      setSuccess('E-mail fiók kapcsolat sikeresen eltávolítva!')
-    } catch (err: any) {
-      setError(err.message || 'Hiba történt a törlés során.')
-    }
-  }
-
-  const handleManualSync = async () => {
-    setIsSyncing(true)
-    setError('')
-    setSuccess('')
-    try {
-      const token = await auth.currentUser?.getIdToken(true)
-      const res = await fetch('https://api-cdaanjspxq-uc.a.run.app/syncEmailsNow', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token || ''}`,
-        },
-        body: JSON.stringify({}),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Szinkronizálási hiba.')
-      setSuccess(data.message || 'Szinkronizálás kész.')
-    } catch (err: any) {
-      setError(err.message || 'Hiba a levelek szinkronizálásakor.')
-    } finally {
-      setIsSyncing(false)
-    }
-  }
-
-  const forwarderAddress = `${userEmail.replace('@', '-')}-inbound@task.normaflow.hu`
-
-  const handleCopy = () => {
-    navigator.clipboard.writeText(forwarderAddress)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
-  const PROVIDERS: { key: EmailProvider; label: string; desc: string }[] = [
-    { key: 'gmail', label: 'Google Mail', desc: 'Gmail fiókok' },
-    { key: 'outlook', label: 'Outlook', desc: 'Office 365' },
-    { key: 'custom', label: 'Egyéni szerver', desc: 'IMAP / SMTP' },
-  ]
-
-  return (
-    <div className="relative mt-8 space-y-8 animate-fade-in text-slate-100">
-      
-      {/* SECTION 1: Központi NormaFlow Gyűjtőcím */}
-      <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md">
-        <div className="absolute -right-24 -top-24 h-48 w-48 rounded-full bg-indigo-600/5 blur-3xl" />
-        
-        <div className="flex items-center gap-3 border-b border-slate-800/80 pb-4">
-          <div className="p-2.5 rounded-xl bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-            <Inbox className="h-5 w-5" />
-          </div>
-          <div>
-            <h3 className="text-lg font-bold text-white">Központi NormaFlow Gyűjtőcím (Továbbítás)</h3>
-            <p className="text-xs text-slate-400">Automatizálja a feladatokat e-mailek átirányításával</p>
-          </div>
-        </div>
-
-        <div className="mt-6 space-y-4">
-          <p className="text-sm text-slate-300">
-            Irányítsa át ügyfelei leveleit az alábbi egyedi gyűjtőcímre, és a NormaFlow AI motorja másodperceken belül feldolgozza, rendszerezi és a feladatlistájára helyezi őket.
-          </p>
-
-          <div className="flex flex-col sm:flex-row gap-2">
-            <input
-              type="text"
-              readOnly
-              value={forwarderAddress}
-              className="flex-1 rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-sm font-mono text-indigo-300 shadow-inner focus:outline-none"
-            />
-            <button
-              type="button"
-              onClick={handleCopy}
-              className="flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-lg transition-all hover:bg-indigo-500 active:scale-95 whitespace-nowrap"
-            >
-              {copied ? (
-                <>
-                  <Check className="h-4 w-4" />
-                  Másolva!
-                </>
-              ) : (
-                <>
-                  <Copy className="h-4 w-4" />
-                  Másolás
-                </>
-              )}
-            </button>
-          </div>
-
-          <div className="rounded-xl border border-slate-800/80 bg-slate-950/30 p-4 space-y-3">
-            <h4 className="text-xs font-bold text-slate-300 uppercase tracking-wider">Beállítási útmutató:</h4>
-            <ul className="text-xs text-slate-400 space-y-2.5 list-disc list-inside">
-              <li>
-                <strong className="text-slate-300">Gmail továbbítás:</strong> Menjen a <code className="text-indigo-400 bg-slate-950/60 px-1 py-0.5 rounded">Beállítások &gt; Továbbítás és POP/IMAP</code> menüpontba, kattintson a továbbítási cím hozzáadására, és illessze be a fenti címet.
-              </li>
-              <li>
-                <strong className="text-slate-300">Outlook továbbítás:</strong> A <code className="text-indigo-400 bg-slate-950/60 px-1 py-0.5 rounded">Beállítások &gt; Levelezés &gt; Szabályok</code> részben hozzon létre egy szabályt, amely a beérkező leveleket továbbítja a fenti címre.
-              </li>
-            </ul>
-          </div>
-        </div>
-      </div>
-
-      {/* SECTION 2: Multi-IMAP Account Connections Card */}
-      <div className="relative overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl backdrop-blur-md">
-        <div className="absolute -left-24 -top-24 h-48 w-48 rounded-full bg-violet-600/5 blur-3xl" />
-        
-        {/* Header */}
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-slate-800/80 pb-6">
-          <div>
-            <div className="flex items-center gap-2">
-              <Mail className="h-5 w-5 text-violet-400" />
-              <h3 className="text-lg font-bold tracking-tight text-white">Csatlakoztatott Levelezőfiókok</h3>
-            </div>
-            <p className="mt-1 text-sm text-slate-400">
-              Kapcsoljon össze több külső fiókot az e-mailek folyamatos IMAP szinkronizációjához.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setIsAddOpen(!isAddOpen)}
-            className="flex items-center justify-center gap-2 rounded-xl bg-violet-600 px-4 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-violet-500 active:scale-95"
-          >
-            {isAddOpen ? (
-              <>
-                <X className="h-4 w-4" />
-                Mégse
-              </>
-            ) : (
-              <>
-                <Plus className="h-4 w-4" />
-                Új fiók hozzáadása
-              </>
-            )}
-          </button>
-        </div>
-
-        <div className="mt-6 space-y-6">
-          {error && (
-            <div className="rounded-lg bg-red-500/15 border border-red-500/20 p-3 text-xs font-medium text-red-400">{error}</div>
-          )}
-          {success && (
-            <div className="rounded-lg bg-emerald-500/15 border border-emerald-500/20 p-3 text-xs font-medium text-emerald-400">{success}</div>
-          )}
-
-          {/* Add Connection Sliding Panel */}
-          {isAddOpen && (
-            <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-5 space-y-4 animate-slide-down">
-              <h4 className="text-sm font-bold text-white">Új Levelezőfiók Csatlakoztatása</h4>
-              
-              {/* Provider Selector */}
-              <div className="flex gap-2">
-                {PROVIDERS.map((p) => (
-                  <button
-                    key={p.key}
-                    type="button"
-                    onClick={() => handleProviderChange(p.key)}
-                    className={`flex-1 rounded-xl border p-3 text-center transition-all ${
-                      provider === p.key
-                        ? 'border-violet-500/50 bg-violet-500/10 text-white'
-                        : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700 hover:text-slate-300'
-                    }`}
-                  >
-                    <div className="text-sm font-semibold">{p.label}</div>
-                    <div className="text-[10px] mt-0.5 opacity-70">{p.desc}</div>
-                  </button>
-                ))}
-              </div>
-
-              {/* Form */}
-              <form onSubmit={handleAddConnection} className="space-y-4">
-                {/* Connection Mode Toggle */}
-                <div className="space-y-2">
-                  <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Kapcsolódási Mód</label>
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setConnectionType('direct')}
-                      className={`flex-1 rounded-xl border p-2.5 text-center text-xs font-semibold transition-all ${
-                        connectionType === 'direct'
-                          ? 'border-violet-500/50 bg-violet-500/10 text-white'
-                          : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700'
-                      }`}
-                    >
-                      Direkt szinkronizáció (Kétirányú IMAP/SMTP)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConnectionType('forwarder')}
-                      className={`flex-1 rounded-xl border p-2.5 text-center text-xs font-semibold transition-all ${
-                        connectionType === 'forwarder'
-                          ? 'border-violet-500/50 bg-violet-500/10 text-white'
-                          : 'border-slate-800 bg-slate-900/40 text-slate-400 hover:border-slate-700'
-                      }`}
-                    >
-                      Automatikus továbbítás (Forwarder webhook)
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">E-mail cím</label>
-                  <input
-                    type="email"
-                    required
-                    value={configEmail}
-                    onChange={(e) => setConfigEmail(e.target.value)}
-                    placeholder={provider === 'gmail' || provider === 'google' ? 'user@gmail.com' : 'user@outlook.com'}
-                    className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                  />
-                </div>
-
-                {connectionType === 'direct' ? (
-                  <>
-                    <div>
-                      <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">
-                        {provider === 'gmail' || provider === 'google' || provider === 'outlook' ? 'Alkalmazásjelszó' : 'Jelszó'}
-                      </label>
-                      <input
-                        type="password"
-                        required
-                        value={configPassword}
-                        onChange={(e) => setConfigPassword(e.target.value)}
-                        placeholder="••••••••"
-                        className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">IMAP szerver</label>
-                        <input
-                          type="text"
-                          required
-                          value={imapHost}
-                          onChange={(e) => setImapHost(e.target.value)}
-                          placeholder="imap.gmail.com"
-                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">IMAP port</label>
-                        <input
-                          type="number"
-                          required
-                          value={imapPort}
-                          onChange={(e) => setImapPort(e.target.value)}
-                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP szerver</label>
-                        <input
-                          type="text"
-                          required
-                          value={smtpHost}
-                          onChange={(e) => setSmtpHost(e.target.value)}
-                          placeholder="smtp.gmail.com"
-                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP port</label>
-                        <input
-                          type="number"
-                          required
-                          value={smtpPort}
-                          onChange={(e) => setSmtpPort(e.target.value)}
-                          className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
-                        />
-                      </div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="space-y-4">
-                    <div className="rounded-xl border border-slate-800/80 bg-slate-950/40 p-4 space-y-2">
-                      <div className="flex justify-between items-center">
-                        <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">Webhook gyűjtőcím</label>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const addr = `${configEmail.trim().replace('@', '-')}-inbound@task.normaflow.hu`
-                            navigator.clipboard.writeText(addr)
-                            alert('Másolva: ' + addr)
-                          }}
-                          className="text-[10px] font-bold text-violet-400 hover:text-violet-300 underline"
-                        >
-                          Másolás
-                        </button>
-                      </div>
-                      <input
-                        type="text"
-                        readOnly
-                        value={configEmail.trim() ? `${configEmail.trim().replace('@', '-')}-inbound@task.normaflow.hu` : 'Adja meg a fenti e-mail címet...'}
-                        className="w-full rounded-xl border border-slate-700/50 bg-slate-950/40 p-2.5 text-xs text-slate-400 font-mono focus:outline-none"
-                      />
-                      <p className="text-[10px] text-slate-500">
-                        Irányítsa át az e-maileket erre a címre a Gmail vagy Outlook beállításainál.
-                      </p>
-                    </div>
-
-                    {/* Expandable sub-form for optional SMTP */}
-                    <div className="border border-slate-800 rounded-xl bg-slate-900/20 overflow-hidden">
-                      <button
-                        type="button"
-                        onClick={() => setShowForwarderSmtp(!showForwarderSmtp)}
-                        className="w-full flex items-center justify-between p-3.5 text-xs font-semibold text-slate-300 hover:bg-slate-800/40 transition-colors"
-                      >
-                        <span>Kimenő levelek küldése erről a címről (Opcionális SMTP beállítások)</span>
-                        <span className="text-slate-500">{showForwarderSmtp ? '▲' : '▼'}</span>
-                      </button>
-                      {showForwarderSmtp && (
-                        <div className="p-4 border-t border-slate-800 space-y-4">
-                          <div>
-                            <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP Alkalmazásjelszó</label>
-                            <input
-                              type="password"
-                              value={configPassword}
-                              onChange={(e) => setConfigPassword(e.target.value)}
-                              placeholder="••••••••"
-                              className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                            />
-                          </div>
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                            <div>
-                              <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP szerver</label>
-                              <input
-                                type="text"
-                                value={smtpHost}
-                                onChange={(e) => setSmtpHost(e.target.value)}
-                                placeholder="smtp.gmail.com"
-                                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 placeholder-slate-600 focus:border-violet-500 focus:outline-none"
-                              />
-                            </div>
-                            <div>
-                              <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider">SMTP port</label>
-                              <input
-                                type="number"
-                                value={smtpPort}
-                                onChange={(e) => setSmtpPort(e.target.value)}
-                                className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-200 focus:border-violet-500 focus:outline-none"
-                              />
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-
-                <button
-                  type="submit"
-                  disabled={isLoading}
-                  className="flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-xs font-semibold text-white shadow-lg transition-all hover:bg-violet-500 active:scale-95 disabled:opacity-55"
-                >
-                  {isLoading ? 'Kapcsolódás…' : 'Fiók hozzáadása'}
-                </button>
-              </form>
-            </div>
-          )}
-
-          {/* Account connections list */}
-          <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950/30">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="border-b border-slate-800 text-slate-400 text-xs font-semibold uppercase bg-slate-900/30">
-                  <th className="p-4">Szolgáltató</th>
-                  <th className="p-4">E-mail cím</th>
-                  <th className="p-4">Szinkronizálva</th>
-                  <th className="p-4 text-right">Művelet</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60 text-sm">
-                {connections.length === 0 ? (
-                  <tr>
-                    <td colSpan={4} className="p-8 text-center text-slate-500 text-xs font-medium">
-                      Nincs még csatlakoztatott levelezőfiók.
-                    </td>
-                  </tr>
-                ) : (
-                  connections.map((conn) => (
-                    <tr key={conn.id} className="hover:bg-slate-900/30 transition-colors">
-                      <td className="p-4">
-                        <div className="flex flex-wrap gap-1.5 items-center">
-                          <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold capitalize border ${
-                            conn.provider === 'google' || conn.provider === 'gmail'
-                              ? 'bg-red-500/10 text-red-400 border-red-500/20'
-                              : conn.provider === 'outlook'
-                              ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
-                              : 'bg-violet-500/10 text-violet-400 border-violet-500/20'
-                          }`}>
-                            {conn.provider === 'google' ? 'Gmail' : conn.provider}
-                          </span>
-                          <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold border ${
-                            conn.connection_type === 'direct'
-                              ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                              : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                          }`}>
-                            {conn.connection_type === 'direct' ? 'Direkt' : 'Továbbítás'}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="p-4 font-medium text-slate-200">{conn.email}</td>
-                      <td className="p-4 text-xs text-slate-500 font-mono">
-                        {conn.connected_at ? new Date(conn.connected_at).toLocaleString('hu-HU') : 'Ismeretlen'}
-                      </td>
-                      <td className="p-4 text-right">
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteConnection(conn.id)}
-                          className="p-2 rounded-lg bg-red-500/10 text-red-400 border border-red-500/10 hover:bg-red-500/20 hover:text-red-300 transition-all"
-                          title="Fiók törlése"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-
-          {/* Manual sync and details */}
-          {connections.some(c => c.connection_type === 'direct') && (
-            <div className="border-t border-slate-800/80 pt-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-              <button
-                type="button"
-                onClick={handleManualSync}
-                disabled={isSyncing}
-                className="flex items-center justify-center gap-2 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-5 py-2.5 text-xs font-semibold text-indigo-400 hover:bg-indigo-500/20 transition-all active:scale-95 disabled:opacity-55 w-full sm:w-auto"
-              >
-                {isSyncing ? (
-                  <>
-                    <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-indigo-400/30 border-t-indigo-400" />
-                    Szinkronizálás…
-                  </>
-                ) : (
-                  <>
-                    <Mail className="h-3.5 w-3.5" />
-                    Levelek szinkronizálása most
-                  </>
-                )}
-              </button>
-              <p className="text-[10px] text-slate-500">
-                Az automatikus háttérszinkronizáció 5 percenként fut a csatlakoztatott fiókokon.
-              </p>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
 
 
 
@@ -2151,11 +1662,13 @@ export default function App() {
   const hasAccess = subscriptionStatus === 'active'
 
   // AI automation states
-  const [activeTab, setActiveTab] = useState<'tasks' | 'automation'>('tasks')
+  const [activeTab, setActiveTab] = useState<'tasks' | 'inbox' | 'automation'>('tasks')
   const [automationEnabled, setAutomationEnabled] = useState(false)
   const [promptRules, setPromptRules] = useState(
     'Ha az ügyfél számlát kér, válaszolj udvariasan, hogy feldolgozzuk és küldjük. Válasz végére írd oda: Üdvözlettel, NormaFlow Asszisztens.'
   )
+  const [globalAutomation, setGlobalAutomation] = useState(false)
+  const [exclusionRules, setExclusionRules] = useState('')
   const [enforceWhitelist, setEnforceWhitelist] = useState(true)
   
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false)
@@ -2295,6 +1808,8 @@ export default function App() {
         if (user.email) {
           try {
             const userRef = doc(db, 'users', user.email)
+            // Save uid to the user's document for mapping in webhooks
+            await setDoc(userRef, { uid: user.uid }, { merge: true })
             const docSnap = await getDoc(userRef)
             if (docSnap.exists()) {
               const data = docSnap.data()
@@ -2455,17 +1970,22 @@ export default function App() {
     }
   }
 
-  const handleSaveAutomation = async (rules: string, enabled: boolean) => {
+  const handleSaveAutomation = async (rules: string, enabled: boolean, globalAuto: boolean, exclRules: string) => {
     if (!userEmail) return
     try {
       const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
       await setDoc(settingsRef, {
         automationEnabled: enabled,
-        promptRules: rules
+        promptRules: rules,
+        globalAutomation: globalAuto,
+        globalAutomationEnabled: globalAuto,
+        exclusionRules: exclRules
       }, { merge: true })
 
       setPromptRules(rules)
       setAutomationEnabled(enabled)
+      setGlobalAutomation(globalAuto)
+      setExclusionRules(exclRules)
       
       // Trigger notification
       const toastId = generateId()
@@ -2620,6 +2140,10 @@ export default function App() {
           if (data.promptRules) {
             setPromptRules(data.promptRules)
           }
+          setGlobalAutomation(!!data.globalAutomation || !!data.globalAutomationEnabled)
+          if (data.exclusionRules) {
+            setExclusionRules(data.exclusionRules)
+          }
           setEnforceWhitelist(data.enforceWhitelist !== false)
         }
       } catch (err) {
@@ -2653,6 +2177,7 @@ export default function App() {
       {authReady && userEmail && subscriptionStatus === 'active' && (
         <MainDashboard
           userEmail={userEmail}
+          userId={auth.currentUser?.uid || ''}
           tasks={tasks}
           categoryFilter={categoryFilter}
           onCategoryChange={setCategoryFilter}
@@ -2663,6 +2188,8 @@ export default function App() {
           onTabChange={setActiveTab}
           automationEnabled={automationEnabled}
           promptRules={promptRules}
+          globalAutomation={globalAutomation}
+          exclusionRules={exclusionRules}
           onSaveAutomation={handleSaveAutomation}
           onOpenFeedback={() => setIsFeedbackOpen(true)}
           processedEmailsThisMonth={processedEmailsThisMonth}
