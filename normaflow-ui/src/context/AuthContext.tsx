@@ -87,14 +87,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 tier: data.tier || 'none',
                 processedEmailsThisMonth: data.processedEmailsThisMonth || 0,
               })
+              setIsLoading(false)
+            } else {
+              setIsLoading(false)
             }
+          }, (error) => {
+            console.error('Error fetching user document:', error)
+            setIsLoading(false)
           })
 
           return () => unsubscribeUser()
+        } else {
+          setIsLoading(false)
         }
+      } else {
+        setUser(null)
+        setIsLoading(false)
       }
-      setUser(null)
-      setIsLoading(false)
     })
 
     return () => unsubscribe()
