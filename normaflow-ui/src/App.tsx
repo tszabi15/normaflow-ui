@@ -23,7 +23,7 @@ import TaskCard from './components/dashboard/TaskCard'
 import ManualReplyModal from './components/dashboard/ManualReplyModal'
 import { db, auth } from './firebase'
 import { collection, query, where, onSnapshot, doc, setDoc, getDoc, addDoc, deleteDoc } from 'firebase/firestore'
-import { signOut } from 'firebase/auth'
+import { useAuth } from './context/AuthContext'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -767,17 +767,13 @@ function WhitelistSettingsCard({
 // ─── App Root ────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [authReady] = useState(false)
-  const [userEmail, setUserEmail] = useState<string | null>(null)
-  const [subscriptionStatus, setSubscriptionStatus] = useState<string>('none')
-  const [processedEmailsThisMonth, setProcessedEmailsThisMonth] = useState<number>(0)
-  const [tier, setTier] = useState<string>('none')
+  const { user, isLoading, logout } = useAuth()
   const [tasks, setTasks] = useState<Task[]>([])
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('Összes')
   const [completingIds, setCompletingIds] = useState<Set<string>>(new Set())
   const [toasts, setToasts] = useState<Toast[]>([])
 
-  const hasAccess = subscriptionStatus === 'active'
+  const hasAccess = user?.subscriptionStatus === 'active'
 
   // AI automation states
   const [activeTab, setActiveTab] = useState<'tasks' | 'inbox' | 'automation'>('tasks')
@@ -808,48 +804,16 @@ export default function App() {
     promptRulesRef.current = promptRules
   }, [promptRules])
 
-  // Listen for user subscriptionStatus in Firestore in real time
-  useEffect(() => {
-    if (!userEmail) {
-      setSubscriptionStatus('none')
-      return
-    }
-
-    const userRef = doc(db, 'users', userEmail)
-    const unsubscribe = onSnapshot(userRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data()
-        setSubscriptionStatus(data?.subscriptionStatus ?? 'none')
-        setProcessedEmailsThisMonth(data?.processedEmailsThisMonth ?? 0)
-        setTier(data?.tier ?? 'none')
-      } else {
-        setSubscriptionStatus('none')
-        setProcessedEmailsThisMonth(0)
-        setTier('none')
-      }
-    }, (error) => {
-      console.error('Error fetching subscription status:', error)
-      setSubscriptionStatus('none')
-      setProcessedEmailsThisMonth(0)
-      setTier('none')
-    })
-
-    return () => unsubscribe()
-  }, [userEmail])
-
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
 
   const handleLogout = async () => {
     try {
-      await signOut(auth)
+      await logout()
     } catch (err) {
       console.error('Logout error:', err)
     }
-    setUserEmail(null)
-    setSubscriptionStatus('none')
-    setTier('none')
     setCategoryFilter('Összes')
     setCompletingIds(new Set())
     setToasts([])
@@ -859,8 +823,8 @@ export default function App() {
   }
 
   const handleSelectTier = async (selectedTier: SubscriptionTier) => {
-    if (!userEmail) return
-    const userRef = doc(db, 'users', userEmail)
+    if (!user?.email) return
+    const userRef = doc(db, 'users', user.email)
     await setDoc(userRef, {
       subscriptionStatus: 'active',
       tier: selectedTier,
@@ -947,9 +911,9 @@ export default function App() {
   }
 
   const handleToggleWhitelist = async (checked: boolean) => {
-    if (!userEmail) return
+    if (!user?.email) return
     try {
-      const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
+      const settingsRef = doc(db, `users/${user.email}/settings/auto_responder`)
       await setDoc(settingsRef, {
         enforceWhitelist: checked
       }, { merge: true })
@@ -996,11 +960,11 @@ export default function App() {
 
   // Real-time Firestore tasks subscription
   useEffect(() => {
-    if (!hasAccess || !userEmail) return
+    if (!hasAccess || !user?.email) return
 
     const q = query(
       collection(db, 'tasks'),
-      where('user_email', '==', userEmail)
+      where('user_email', '==', user.email)
     )
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -1059,13 +1023,13 @@ export default function App() {
     })
 
     return () => unsubscribe()
-  }, [hasAccess, userEmail])
+  }, [hasAccess, user?.email])
 
   // Load auto-responder settings from Firestore on mount/login
   useEffect(() => {
-    if (!hasAccess || !userEmail) return
+    if (!hasAccess || !user?.email) return
 
-    const settingsRef = doc(db, `users/${userEmail}/settings/auto_responder`)
+    const settingsRef = doc(db, `users/${user.email}/settings/auto_responder`)
     const fetchSettings = async () => {
       try {
         const docSnap = await getDoc(settingsRef)
@@ -1083,32 +1047,32 @@ export default function App() {
     }
 
     fetchSettings()
-  }, [hasAccess, userEmail])
+  }, [hasAccess, user?.email])
 
   return (
     <>
-      {!authReady && (
+      {isLoading && (
         <div className="flex min-h-screen items-center justify-center bg-slate-950">
           <span className="h-8 w-8 animate-spin rounded-full border-2 border-indigo-400 border-t-transparent" />
         </div>
       )}
 
-      {authReady && !userEmail && (
+      {!isLoading && !user && (
         <LoginView onAuthenticated={() => {}} />
       )}
 
-      {authReady && userEmail && subscriptionStatus !== 'active' && (
+      {!isLoading && user && user.subscriptionStatus !== 'active' && (
         <PaywallView
-          userEmail={userEmail}
+          userEmail={user.email}
           onSelectTier={handleSelectTier}
           onLogout={handleLogout}
         />
       )}
 
-      {authReady && userEmail && subscriptionStatus === 'active' && (
+      {!isLoading && user && user.subscriptionStatus === 'active' && (
         <MainDashboard
-          userEmail={userEmail}
-          userId={auth.currentUser?.uid || ''}
+          userEmail={user.email}
+          userId={user.uid}
           tasks={tasks}
           categoryFilter={categoryFilter}
           onCategoryChange={setCategoryFilter}
@@ -1118,8 +1082,8 @@ export default function App() {
           activeTab={activeTab}
           onTabChange={setActiveTab}
           onOpenFeedback={() => setIsFeedbackOpen(true)}
-          processedEmailsThisMonth={processedEmailsThisMonth}
-          tier={tier}
+          processedEmailsThisMonth={user.processedEmailsThisMonth}
+          tier={user.tier}
           enforceWhitelist={enforceWhitelist}
           onToggleWhitelist={handleToggleWhitelist}
           onWriteReply={handleWriteReply}
@@ -1132,14 +1096,14 @@ export default function App() {
         isOpen={isFeedbackOpen}
         onClose={() => setIsFeedbackOpen(false)}
         onSubmit={handleSubmitFeedback}
-        userEmail={userEmail || ''}
+        userEmail={user?.email || ''}
       />
 
       {/* Manual Reply Modal */}
       {replyTask && (
         <ManualReplyModal
           replyTask={replyTask}
-          userEmail={userEmail || ''}
+          userEmail={user?.email || ''}
           onClose={() => setReplyTask(null)}
           onReplySent={() => {
             setReplyTask(null)

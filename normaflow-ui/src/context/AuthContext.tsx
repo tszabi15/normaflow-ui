@@ -68,35 +68,50 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+    let unsubscribeUser: (() => void) | null = null
+
+    const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (unsubscribeUser) {
+        unsubscribeUser()
+        unsubscribeUser = null
+      }
+
       if (firebaseUser) {
         const email = firebaseUser.email
         if (email) {
-          // Ensure user document exists (only on initial signup or if missing vital properties)
-          await ensureUserDocument(email, firebaseUser.uid)
+          try {
+            // Ensure user document exists (only on initial signup or if missing vital properties)
+            await ensureUserDocument(email, firebaseUser.uid)
 
-          // Set up real-time quota tracking
-          const userRef = doc(db, 'users', email)
-          const unsubscribeUser = onSnapshot(userRef, (docSnap) => {
-            if (docSnap.exists()) {
-              const data = docSnap.data()
-              setUser({
-                email: data.email || email,
-                uid: data.uid || firebaseUser.uid,
-                subscriptionStatus: data.subscriptionStatus || 'none',
-                tier: data.tier || 'none',
-                processedEmailsThisMonth: data.processedEmailsThisMonth || 0,
-              })
-              setIsLoading(false)
-            } else {
-              setIsLoading(false)
+            // If user logged out or changed while ensuring document
+            if (auth.currentUser?.uid !== firebaseUser.uid) {
+              return
             }
-          }, (error) => {
-            console.error('Error fetching user document:', error)
-            setIsLoading(false)
-          })
 
-          return () => unsubscribeUser()
+            // Set up real-time quota tracking
+            const userRef = doc(db, 'users', email)
+            unsubscribeUser = onSnapshot(userRef, (docSnap) => {
+              if (docSnap.exists()) {
+                const data = docSnap.data()
+                setUser({
+                  email: data.email || email,
+                  uid: data.uid || firebaseUser.uid,
+                  subscriptionStatus: data.subscriptionStatus || 'none',
+                  tier: data.tier || 'none',
+                  processedEmailsThisMonth: data.processedEmailsThisMonth || 0,
+                })
+                setIsLoading(false)
+              } else {
+                setIsLoading(false)
+              }
+            }, (error) => {
+              console.error('Error fetching user document:', error)
+              setIsLoading(false)
+            })
+          } catch (error) {
+            console.error('Error in auth state change pipeline:', error)
+            setIsLoading(false)
+          }
         } else {
           setIsLoading(false)
         }
@@ -106,7 +121,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
     })
 
-    return () => unsubscribe()
+    return () => {
+      unsubscribeAuth()
+      if (unsubscribeUser) {
+        unsubscribeUser()
+      }
+    }
   }, [])
 
   const signIn = async (email: string, password: string) => {

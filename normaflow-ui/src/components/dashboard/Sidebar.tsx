@@ -1,9 +1,10 @@
 import { Zap, Inbox, Mail, Sparkles, Filter, Lightbulb, LogOut } from 'lucide-react'
+import type { TaskCategory } from '../../types/task'
 
-type CategoryFilter = string
+type CategoryFilter = TaskCategory | 'Összes'
 
 interface SidebarProps {
-  activeTab: string
+  activeTab: 'tasks' | 'inbox' | 'automation'
   categoryFilter: CategoryFilter
   categoryFilters: CategoryFilter[]
   metrics: { counts: Record<string, number> }
@@ -14,7 +15,7 @@ interface SidebarProps {
   tierLabel: string
   processedEmailsThisMonth: number
   limit: number
-  onTabChange: (tab: string) => void
+  onTabChange: (tab: 'tasks' | 'inbox' | 'automation') => void
   onCategoryChange: (category: CategoryFilter) => void
   onOpenFeedback: () => void
   onLogout: () => void
