@@ -648,6 +648,48 @@ const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
 };
 
 /**
+ * Automated Monthly Quota Reset Cron Job
+ * Runs deterministically at midnight (00:00) on the 1st of every month.
+ * Resets processedEmailsThisMonth counter back to 0 for all user profiles.
+ */
+export const resetMonthlyQuota = onSchedule({ schedule: "0 0 1 * *" }, async () => {
+  logger.info("Starting resetMonthlyQuota cron job...");
+  try {
+    const usersSnapshot = await db.collection("users").get();
+    if (usersSnapshot.empty) {
+      logger.info("No users found to reset quota.");
+      return;
+    }
+
+    let batch = db.batch();
+    let count = 0;
+    let totalCount = 0;
+
+    for (const doc of usersSnapshot.docs) {
+      batch.update(doc.ref, {
+        processedEmailsThisMonth: 0
+      });
+      count++;
+      totalCount++;
+
+      // Commit batches of 500 operations to satisfy Firestore write limits
+      if (count === 500) {
+        await batch.commit();
+        batch = db.batch();
+        count = 0;
+      }
+    }
+
+    if (count > 0) {
+      await batch.commit();
+    }
+    logger.info(`Successfully reset monthly quota for ${totalCount} users.`);
+  } catch (err: any) {
+    logger.error("Error in resetMonthlyQuota cron job:", err);
+  }
+});
+
+/**
  * Automated Daily Task Cleanup Cron Job
  * Runs daily at midnight.
  * Deletes tasks in status "archived" where archivedAt is older than 30 days.
@@ -856,7 +898,9 @@ async function processEmailInternally(emailId: string, userEmail: string): Promi
 
   const sender = emailData.sender || "";
   const subject = emailData.subject || "Nincs tárgy";
-  const textContent = emailData.textContent || "";
+  const rawTextContent = emailData.textContent || "";
+  // Enforce strict bounding logic: Truncate raw incoming text stream cleanly to protect API budget
+  const textContent = rawTextContent.slice(0, 6000);
 
   // Quota verification before OpenAI API calls - prevent unnecessary billing
   const userQuota = await getUserQuota(userId);

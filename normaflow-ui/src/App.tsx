@@ -824,12 +824,39 @@ export default function App() {
 
   const handleSelectTier = async (selectedTier: SubscriptionTier) => {
     if (!user?.email) return
-    const userRef = doc(db, 'users', user.email)
-    await setDoc(userRef, {
-      subscriptionStatus: 'active',
-      tier: selectedTier,
-      processedEmailsThisMonth: 0,
-    }, { merge: true })
+    try {
+      const firebaseUser = auth.currentUser
+      if (!firebaseUser) throw new Error('Nem bejelentkezett felhasználó')
+      const token = await firebaseUser.getIdToken()
+
+      // Hardening: Removed client-side direct writes to users/{userId} subscription status/tier
+      // Bypasses local setDoc with a secure backend verify/checkout session network call.
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/verifySubscription`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ tier: selectedTier }),
+      })
+
+      if (!response.ok) {
+        throw new Error('Sikertelen előfizetés frissítés.')
+      }
+
+      const toastId = generateId()
+      setToasts((prev) => [
+        ...prev,
+        {
+          id: toastId,
+          message: 'Előfizetés kezdeményezve',
+          taskSummary: `Csomag: ${selectedTier}. A frissítés hamarosan élesedik.`,
+        },
+      ])
+    } catch (err: any) {
+      console.error('Error starting subscription checkout:', err)
+      alert('Hiba az előfizetés során: ' + err.message)
+    }
   }
 
   const handleCompleteTask = async (id: string) => {

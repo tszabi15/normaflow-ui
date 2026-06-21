@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper to check if the user is authenticated and matches the document's email
+    function isOwner(email) {
+      return request.auth != null && request.auth.token.email == email;
+    }
+
+    match /users/{email} {
+      allow read: if isOwner(email);
+      
+      allow create: if isOwner(email) 
+        && request.resource.data.email == email
+        && request.resource.data.subscriptionStatus == 'none'
+        && request.resource.data.tier == 'none'
+        && request.resource.data.processedEmailsThisMonth == 0;
+        
+      allow update: if isOwner(email)
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['subscriptionStatus', 'tier', 'processedEmailsThisMonth']));
+        
+      allow delete: if false; // Deny user deletion from client
+
+      // Nested user settings/connections/clients
+      match /email_connections/{connectionId} {
+        allow read, write: if isOwner(email);
+      }
+      match /clients/{clientId} {
+        allow read, write: if isOwner(email);
+      }
+      match /settings/{settingId} {
+        allow read, write: if isOwner(email);
+      }
+    }
+
+    match /tasks/{taskId} {
+      allow read, update, delete: if request.auth != null 
+        && request.auth.token.email == resource.data.user_email;
+        
+      allow create: if request.auth != null 
+        && request.auth.token.email == request.resource.data.user_email;
+    }
+
+    match /emails/{emailId} {
+      allow read, update, delete: if request.auth != null 
+        && request.auth.uid == resource.data.user_id;
+        
+      allow create: if request.auth != null 
+        && request.auth.uid == request.resource.data.user_id;
+    }
+
+    match /feedbacks/{feedbackId} {
+      allow read, write: if false; // Handled purely by backend
+    }
+  }
+}
