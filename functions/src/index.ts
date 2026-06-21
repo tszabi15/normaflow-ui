@@ -9,6 +9,10 @@ import * as nodemailer from "nodemailer";
 import express from "express";
 import cors from "cors";
 import * as crypto from "crypto";
+import rateLimit from "express-rate-limit";
+import Stripe from "stripe";
+import { ImapFlow } from "imapflow";
+import { Readable } from "stream";
 
 // Set global options for the functions (max instances for budget/cost control)
 setGlobalOptions({ maxInstances: 10 });
@@ -16,6 +20,22 @@ setGlobalOptions({ maxInstances: 10 });
 // Initialize Firebase Admin
 admin.initializeApp();
 const db = getFirestore();
+
+// Initialize Stripe Node SDK
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+
+// Application-layer Rate Limiter (Anti-Denial of Wallet)
+// Throttle requests per window Ms per unique target IP
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 60, // Limit each IP to 60 requests per minute
+  standardHeaders: true, // Return rate limit info in standard headers
+  legacyHeaders: false, // Disable legacy X-RateLimit headers
+  message: {
+    error: "Too Many Requests",
+    message: "Túllépte a megengedett kérelmek számát. Kérjük próbálja meg később!"
+  }
+});
 
 // ─── Interfaces ──────────────────────────────────────────────────────────────
 
@@ -60,18 +80,6 @@ async function verifyAuthToken(req: any): Promise<{ email: string; uid: string }
   }
 }
 
-/** Verify webhook secret token from GAS router */
-async function verifyWebhookToken(req: any): Promise<boolean> {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return false;
-  const token = authHeader.split("Bearer ")[1];
-  const serverKey = process.env.SERVER_WEBHOOK_KEY;
-  if (!serverKey) {
-    logger.error("SERVER_WEBHOOK_KEY not configured");
-    return false;
-  }
-  return token === serverKey;
-}
 
 /** AES-256-GCM encryption for SMTP passwords */
 const ALGORITHM = 'aes-256-gcm';
@@ -186,90 +194,268 @@ async function resolveSmtpConfig(userEmail: string, preferredEmail?: string): Pr
 }
 
 /**
- * SUBSYSTEM 1: handleIncomingEmail
- * Replaces Make.com e-mail to task pipeline.
- * Input: POST JSON payload: { sender, subject, textContent, userEmail, userId }
+ * Ingress Channel 1: Cloudflare Email Workers Webhook
+ * Hardened endpoint: `/webhook/cloudflare-inbound`
+ * Authenticates request using X-Normaflow-Signature header against CLOUDFLARE_WORKER_SECRET.
+ * Input: POST JSON payload: { extractedUid, sender, subject, textContent }
  */
-const handleIncomingEmailLogic: express.RequestHandler = async (req, res) => {
+interface CloudflareInboundRequest {
+  extractedUid: string;
+  sender: string;
+  subject: string;
+  textContent: string;
+}
+
+const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): Promise<void> => {
   try {
     if (req.method !== "POST") {
-      logger.warn(`Method Not Allowed: ${req.method}`);
+      logger.warn(`cloudflareInboundWebhook: Method Not Allowed: ${req.method}`);
       res.status(405).json({ error: "Method Not Allowed" });
       return;
     }
 
-    // Webhook authentication - prevent spoofing and denial of wallet
-    if (!(await verifyWebhookToken(req))) {
-      logger.warn("handleIncomingEmail: Unauthorized webhook request");
-      res.status(401).json({ error: "Unauthorized" });
+    // Secure the route with header validation handshake
+    const signature = req.headers["x-normaflow-signature"];
+    const secret = process.env.CLOUDFLARE_WORKER_SECRET || "";
+    if (!secret || signature !== secret) {
+      logger.warn("cloudflareInboundWebhook: Unauthorized request signature.");
+      res.status(401).json({ error: "Unauthorized: Invalid signature" });
       return;
     }
 
-    const toField = (req.body.to || "").trim();
-    const plusIndex = toField.indexOf("+");
-    const atIndex = toField.indexOf("@");
-
-    if (plusIndex === -1 || atIndex === -1 || plusIndex >= atIndex) {
-      logger.error("Invalid routing format in 'to' field:", toField);
-      res.status(400).json({ error: "Missing user routing token" });
+    const { extractedUid, sender, subject, textContent } = req.body as CloudflareInboundRequest;
+    if (!extractedUid || !sender || !subject || !textContent) {
+      logger.warn("cloudflareInboundWebhook: Missing required payload properties");
+      res.status(400).json({ error: "Bad Request: Missing parameters" });
       return;
     }
-    const extractedUid = toField.substring(plusIndex + 1, atIndex).trim();
 
     // Map extractedUid to registered email address
     const userQuery = await db.collection("users").where("uid", "==", extractedUid).limit(1).get();
     if (userQuery.empty) {
-      logger.warn(`User with UID ${extractedUid} not found`);
+      logger.warn(`cloudflareInboundWebhook: User with UID ${extractedUid} not found`);
       res.status(404).json({ error: "User not found" });
       return;
     }
     const userDoc = userQuery.docs[0];
     const userEmail = userDoc.id;
 
-    logger.info(`Saving raw incoming email from webhook for user UID: ${extractedUid} (${userEmail}) - public route`);
-    let cleanSender = req.body.from || "Ismeretlen";
+    logger.info(`cloudflareInboundWebhook: Ingesting email for UID ${extractedUid} (${userEmail})`);
+    
+    let cleanSender = sender.trim();
     if (cleanSender.includes("<")) {
       const match = cleanSender.match(/<([^>]+)>/);
       if (match && match[1]) cleanSender = match[1].trim();
     }
     cleanSender = cleanSender.toLowerCase().trim();
 
+    // Slice input to a strict maximum of 6000 characters
+    const slicedText = textContent.slice(0, 6000);
+
     const emailDocRef = await db.collection("emails").add({
       user_id: extractedUid,
       sender: cleanSender,
-      subject: req.body.subject || "Nincs tárgy",
-      textContent: req.body.text || "",
+      subject: subject || "Nincs tárgy",
+      textContent: slicedText,
       received_at: new Date().toISOString(),
       status: "unread",
-      received_via: "gas_router"
+      received_via: "cloudflare_worker"
     });
 
-    // Autonomous Trigger Hook
+    // Autonomous Trigger Hook (Transactional Quota Verification and AI Processing)
     try {
       const aiConfigDoc = await db.doc(`users/${extractedUid}/settings/ai_configuration`).get();
       if (aiConfigDoc.exists && aiConfigDoc.data()?.globalAutomationEnabled === true) {
-        logger.info(`handleIncomingEmailLogic: Auto-processing email ${emailDocRef.id} for user UID ${extractedUid}`);
+        logger.info(`cloudflareInboundWebhook: Auto-processing email ${emailDocRef.id} for user UID ${extractedUid}`);
         await processEmailInternally(emailDocRef.id, userEmail);
       } else {
-        logger.info(`handleIncomingEmailLogic: Automation disabled for user UID ${extractedUid}, email saved without AI processing (zero credits consumed)`);
+        logger.info(`cloudflareInboundWebhook: Automation disabled for user UID ${extractedUid}, email saved without AI processing`);
       }
-    } catch (autoErr) {
-      logger.error(`handleIncomingEmailLogic: Autonomous processing check failed for email ${emailDocRef.id}:`, autoErr);
+    } catch (autoErr: unknown) {
+      const autoErrMsg = autoErr instanceof Error ? autoErr.message : String(autoErr);
+      logger.error(`cloudflareInboundWebhook: Autonomous processing check failed for email ${emailDocRef.id}:`, autoErrMsg);
     }
 
     res.status(200).json({
       status: "success",
       emailId: emailDocRef.id
     });
-  } catch (error) {
+  } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    logger.error("Error in handleIncomingEmail:", errorMessage);
+    logger.error("Error in cloudflareInboundWebhook:", errorMessage);
     res.status(500).json({
       error: "Internal Server Error",
       message: errorMessage,
     });
   }
 };
+
+async function streamToString(stream: Readable): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * Ingress Channel 2: Distributed IMAP Polling (Cron Framework)
+ * Scheduled Cloud Function running every 5 minutes.
+ * Scans active users' Gmail inboxes for unseen messages, commits them, and flags them as read.
+ */
+export const scheduledImapPolling = onSchedule({
+  schedule: "every 5 minutes",
+  secrets: ["OPENAI_API_KEY", "ENCRYPTION_KEY"],
+  maxInstances: 1, // Avoid overlapping runs
+}, async (event): Promise<void> => {
+  logger.info("scheduledImapPolling: Starting distributed IMAP poll loop.");
+
+  try {
+    const usersSnapshot = await db.collection("users")
+      .where("subscriptionStatus", "==", "active")
+      .get();
+
+    logger.info(`scheduledImapPolling: Found ${usersSnapshot.size} active users to poll.`);
+
+    for (const userDoc of usersSnapshot.docs) {
+      const userEmail = userDoc.id;
+      const userData = userDoc.data();
+      const userId = userData.uid || userDoc.id;
+
+      try {
+        const connsSnapshot = await db.collection("users").doc(userEmail).collection("email_connections").get();
+        if (connsSnapshot.empty) {
+          logger.info(`scheduledImapPolling: No email connections found for user ${userEmail}`);
+          continue;
+        }
+
+        for (const connDoc of connsSnapshot.docs) {
+          const connData = connDoc.data();
+          const emailAddress = connData.email;
+          const encryptedPassword = connData.password;
+
+          if (!emailAddress || !encryptedPassword) {
+            logger.warn(`scheduledImapPolling: Missing email or password for connection ${connDoc.id} under ${userEmail}`);
+            continue;
+          }
+
+          let decryptedPassword = "";
+          try {
+            decryptedPassword = decrypt(encryptedPassword);
+          } catch (decryptErr: unknown) {
+            const decryptErrMsg = decryptErr instanceof Error ? decryptErr.message : String(decryptErr);
+            logger.error(`scheduledImapPolling: Failed to decrypt password for connection ${emailAddress} of user ${userEmail}`, decryptErrMsg);
+            continue;
+          }
+
+          const client = new ImapFlow({
+            host: "imap.gmail.com",
+            port: 993,
+            secure: true,
+            auth: {
+              user: emailAddress,
+              pass: decryptedPassword,
+            },
+            logger: false,
+          });
+
+          try {
+            await client.connect();
+            logger.info(`scheduledImapPolling: Connected to IMAP for ${emailAddress}`);
+
+            const lock = await client.getMailboxLock("INBOX");
+            try {
+              const sequenceNumbers = await client.search({ seen: false });
+              if (sequenceNumbers && sequenceNumbers.length > 0) {
+                logger.info(`scheduledImapPolling: Found ${sequenceNumbers.length} unseen messages for ${emailAddress}`);
+
+                for (const seq of sequenceNumbers) {
+                  const message = await client.fetchOne(String(seq), { envelope: true });
+                  if (!message) continue;
+
+                  let textContent = "";
+                  try {
+                    const downloadResult = await client.download(String(seq), "TEXT");
+                    if (downloadResult && downloadResult.content) {
+                      textContent = await streamToString(downloadResult.content);
+                    }
+                  } catch (downloadErr: unknown) {
+                    const downloadErrMsg = downloadErr instanceof Error ? downloadErr.message : String(downloadErr);
+                    logger.warn(`scheduledImapPolling: Could not download TEXT part for message ${seq}, trying full download`, downloadErrMsg);
+                    try {
+                      const downloadSource = await client.download(String(seq));
+                      if (downloadSource && downloadSource.content) {
+                        textContent = await streamToString(downloadSource.content);
+                      }
+                    } catch (sourceErr: unknown) {
+                      const sourceErrMsg = sourceErr instanceof Error ? sourceErr.message : String(sourceErr);
+                      logger.error(`scheduledImapPolling: Failed to download source for message ${seq}`, sourceErrMsg);
+                    }
+                  }
+
+                  let cleanSender = "";
+                  if (message.envelope && message.envelope.from && message.envelope.from.length > 0) {
+                    const fromObj = message.envelope.from[0];
+                    const address = fromObj.address || "";
+                    cleanSender = address.toLowerCase().trim();
+                  } else {
+                    cleanSender = "unknown@inbound.normaflow.hu";
+                  }
+
+                  const subject = message.envelope?.subject || "Nincs tárgy";
+                  const textContentSliced = textContent.slice(0, 6000);
+
+                  const emailDocRef = await db.collection("emails").add({
+                    user_id: userId,
+                    sender: cleanSender,
+                    subject: subject,
+                    textContent: textContentSliced,
+                    received_at: new Date().toISOString(),
+                    status: "unread",
+                    received_via: "imap"
+                  });
+
+                  try {
+                    const aiConfigDoc = await db.doc(`users/${userId}/settings/ai_configuration`).get();
+                    if (aiConfigDoc.exists && aiConfigDoc.data()?.globalAutomationEnabled === true) {
+                      logger.info(`scheduledImapPolling: Auto-processing email ${emailDocRef.id} for user ${userEmail}`);
+                      await processEmailInternally(emailDocRef.id, userEmail);
+                    }
+                  } catch (autoErr: unknown) {
+                    const autoErrMsg = autoErr instanceof Error ? autoErr.message : String(autoErr);
+                    logger.error(`scheduledImapPolling: Automatic processing failed for email ${emailDocRef.id}:`, autoErrMsg);
+                  }
+
+                  await client.messageFlagsAdd(String(seq), ["\\Seen"]);
+                }
+              } else {
+                logger.info(`scheduledImapPolling: No unseen messages for ${emailAddress}`);
+              }
+            } finally {
+              lock.release();
+            }
+          } catch (imapErr: unknown) {
+            const imapErrMsg = imapErr instanceof Error ? imapErr.message : String(imapErr);
+            logger.error(`scheduledImapPolling: IMAP error for connection ${emailAddress}:`, imapErrMsg);
+          } finally {
+            try {
+              await client.logout();
+            } catch (logoutErr: unknown) {
+              const logoutErrMsg = logoutErr instanceof Error ? logoutErr.message : String(logoutErr);
+              logger.error(`scheduledImapPolling: Logout failed for client:`, logoutErrMsg);
+            }
+          }
+        }
+      } catch (userErr: unknown) {
+        const userErrMsg = userErr instanceof Error ? userErr.message : String(userErr);
+        logger.error(`scheduledImapPolling: Failed to process connections for user ${userEmail}:`, userErrMsg);
+      }
+    }
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error("Error in scheduledImapPolling main loop:", errorMessage);
+  }
+});
 
 /**
  * SUBSYSTEM 2: handleFeedbackSubmit
@@ -970,16 +1156,59 @@ async function processEmailInternally(emailId: string, userEmail: string): Promi
   // Enforce strict bounding logic: Truncate raw incoming text stream cleanly to protect API budget
   const textContent = rawTextContent.slice(0, 6000);
 
-  // Quota verification before OpenAI API calls - prevent unnecessary billing
-  const userQuota = await getUserQuota(userId);
-  if (!userQuota) {
-    logger.error(`processEmailInternally: Failed to fetch quota for user ${userId}`);
+  // Firestore Transaction to prevent TOCTOU race condition (atomically check & increment)
+  try {
+    await db.runTransaction(async (transaction) => {
+      const userRef = db.collection("users").doc(userEmail);
+      const userDoc = await transaction.get(userRef);
+      if (!userDoc.exists) {
+        throw new Error("user_not_found");
+      }
+
+      const userData = userDoc.data();
+      if (!userData) {
+        throw new Error("user_not_found");
+      }
+
+      const subscriptionStatus = userData.subscriptionStatus || "none";
+      if (subscriptionStatus !== "active") {
+        throw new Error("subscription_inactive");
+      }
+
+      const tier = (userData.tier || "none") as 'none' | 'basic' | 'pro' | 'ultra';
+      const processedEmailsThisMonth = userData.processedEmailsThisMonth || 0;
+
+      const TIER_LIMITS: Record<string, number> = {
+        none: 0,
+        basic: 500,
+        pro: 1500,
+        ultra: 5000
+      };
+      const limit = TIER_LIMITS[tier] || 0;
+
+      if (processedEmailsThisMonth >= limit) {
+        throw new Error("quota_exceeded");
+      }
+
+      // Atomically increment the usage counter inside the transaction
+      transaction.update(userRef, {
+        processedEmailsThisMonth: admin.firestore.FieldValue.increment(1)
+      });
+    });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg === "quota_exceeded") {
+      logger.warn(`processEmailInternally: User ${userEmail} quota exceeded during transactional check.`);
+      await emailRef.update({ status: "quota_exceeded" });
+      return { status: "quota_exceeded", reason: "Tier limit exceeded" };
+    }
+    if (errMsg === "subscription_inactive") {
+      logger.warn(`processEmailInternally: User ${userEmail} subscription is inactive.`);
+      await emailRef.update({ status: "subscription_inactive" });
+      return { status: "subscription_inactive", reason: "Active subscription required" };
+    }
+    logger.error(`processEmailInternally: Transaction failure for ${userEmail}:`, errMsg);
     return { status: "quota_error" };
-  }
-  if (hasExceededQuota(userQuota)) {
-    logger.warn(`processEmailInternally: User ${userId} has exceeded tier limit (${userQuota.tier}: ${userQuota.processedEmailsThisMonth})`);
-    await emailRef.update({ status: "quota_exceeded" });
-    return { status: "quota_exceeded", reason: "Tier limit exceeded" };
   }
 
   if (!process.env.OPENAI_API_KEY) {
@@ -989,10 +1218,11 @@ async function processEmailInternally(emailId: string, userEmail: string): Promi
 
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // ── PHASE 1: AI Pre-Filter ──────────────────────────────────────────────
-  if (exclusionRules.trim()) {
-    try {
-      const filterPrompt = `Te a NormaFlow AI szűrője vagy. A feladatod eldönteni, hogy az alábbi e-mail releváns-e egy könyvelőiroda számára, vagy figyelmen kívül hagyható.
+  try {
+    // ── PHASE 1: AI Pre-Filter ──────────────────────────────────────────────
+    if (exclusionRules.trim()) {
+      try {
+        const filterPrompt = `Te a NormaFlow AI szűrője vagy. A feladatod eldönteni, hogy az alábbi e-mail releváns-e egy könyvelőiroda számára, vagy figyelmen kívül hagyható.
 
 A felhasználó szűrési szabályai (milyen leveleket HAGYJON figyelmen kívül):
 ${exclusionRules}
@@ -1001,48 +1231,48 @@ A választ szigorúan JSON formátumban add vissza:
 - "relevant": boolean (true ha a levél releváns és feldolgozandó, false ha figyelmen kívül hagyható)
 - "reason": string (rövid indoklás magyarul)`;
 
-      const filterUserPrompt = `Feladó: ${sender}\nTárgy: ${subject}\nÜzenet:\n${textContent.substring(0, 1500)}`;
+        const filterUserPrompt = `Feladó: ${sender}\nTárgy: ${subject}\nÜzenet:\n${textContent.substring(0, 1500)}`;
 
-      const filterResponse = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: filterPrompt },
-          { role: "user", content: filterUserPrompt },
-        ],
-        response_format: { type: "json_object" },
-        max_tokens: 200,
-      });
-      let filterResult: any;
-      try {
-        filterResult = JSON.parse(filterResponse.choices[0]?.message?.content || "{}");
-      } catch (parseErr) {
-        logger.error(`processEmailInternally: Failed to parse filter JSON for ${userEmail}:`, parseErr);
-        // On parse error, proceed to task generation anyway
-        filterResult = { relevant: true, reason: "Parse error, proceeding with processing" };
-      }
-
-      if (filterResult.relevant === false) {
-        await emailRef.update({
-          status: "filtered",
-          filter_reason: filterResult.reason || "AI szűrő kiszűrte"
+        const filterResponse = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: filterPrompt },
+            { role: "user", content: filterUserPrompt },
+          ],
+          response_format: { type: "json_object" },
+          max_tokens: 200,
         });
-        logger.info(`processEmailInternally: Email ${emailId} filtered out. Reason: ${filterResult.reason}`);
-        return { status: "filtered", reason: filterResult.reason || "AI szűrő kiszűrte" };
+        let filterResult: any;
+        try {
+          filterResult = JSON.parse(filterResponse.choices[0]?.message?.content || "{}");
+        } catch (parseErr) {
+          logger.error(`processEmailInternally: Failed to parse filter JSON for ${userEmail}:`, parseErr);
+          // On parse error, proceed to task generation anyway
+          filterResult = { relevant: true, reason: "Parse error, proceeding with processing" };
+        }
+
+        if (filterResult.relevant === false) {
+          await emailRef.update({
+            status: "filtered",
+            filter_reason: filterResult.reason || "AI szűrő kiszűrte"
+          });
+          logger.info(`processEmailInternally: Email ${emailId} filtered out. Reason: ${filterResult.reason}`);
+          return { status: "filtered", reason: filterResult.reason || "AI szűrő kiszűrte" };
+        }
+      } catch (filterErr) {
+        logger.error(`processEmailInternally: AI pre-filter error for ${userEmail}:`, filterErr);
+        // On filter error, proceed to task generation anyway
       }
-    } catch (filterErr) {
-      logger.error(`processEmailInternally: AI pre-filter error for ${userEmail}:`, filterErr);
-      // On filter error, proceed to task generation anyway
     }
-  }
 
-  // ── PHASE 2: Task Generation ────────────────────────────────────────────
-  let aiReplyDraft: string | null = null;
-  let aiSummary = "Nem sikerült összefoglalót készíteni.";
-  let aiPriorityReason = "";
-  let priorityNum = 3;
+    // ── PHASE 2: Task Generation ────────────────────────────────────────────
+    let aiReplyDraft: string | null = null;
+    let aiSummary = "Nem sikerült összefoglalót készíteni.";
+    let aiPriorityReason = "";
+    let priorityNum = 3;
 
-  try {
-    const systemPrompt = `You are a rigorous, no-nonsense AI accounting assistant. Analyze the provided email payload and return a strict JSON object containing: "summary", "action_items", "priority", "priority_reason", and "reply_draft".
+    try {
+      const systemPrompt = `You are a rigorous, no-nonsense AI accounting assistant. Analyze the provided email payload and return a strict JSON object containing: "summary", "action_items", "priority", "priority_reason", and "reply_draft".
 
 Baseline Priority Logic (Unless overridden by the user's custom priority rules):
 - "Sürgős": Legal/tax deadlines (áfa, bérszámfejtés, NAV, inkasszó), actions required within 48h.
@@ -1057,101 +1287,108 @@ ${customPriorityRules.trim() || "No custom priority rules provided. Rely purely 
 [USER-DEFINED CUSTOM REPLY DRAFTING INSTRUCTIONS]
 ${customReplyRules.trim() || "No custom reply rules provided. Draft a formal, professional response in Hungarian."}`;
 
-    const userPrompt = `[ORIGINAL EMAIL DATA TO PROCESS]
+      const userPrompt = `[ORIGINAL EMAIL DATA TO PROCESS]
 Feladó: ${sender}
 Tárgy: ${subject}
 Dátum: ${emailData.received_at || new Date().toISOString()}
 Levél szövege: 
 ${textContent}`;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      response_format: { type: "json_object" },
-      max_tokens: 1000,
-    });
-    let result: any;
-    try {
-      result = JSON.parse(response.choices[0]?.message?.content || "{}");
-    } catch (parseErr) {
-      logger.error(`processEmailInternally: Failed to parse task generation JSON for ${userEmail}:`, parseErr);
-      // Fallback to default manual review task on parse error
-      result = {
-        summary: subject || "E-mail feldolgozása",
-        action_items: "Manuális felülvizsgálat szükséges",
-        priority: "Közepes",
-        priority_reason: "AI parse error, requires manual review",
-        reply_draft: null
-      };
-    }
+      const response = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 1000,
+      });
+      let result: any;
+      try {
+        result = JSON.parse(response.choices[0]?.message?.content || "{}");
+      } catch (parseErr) {
+        logger.error(`processEmailInternally: Failed to parse task generation JSON for ${userEmail}:`, parseErr);
+        // Fallback to default manual review task on parse error
+        result = {
+          summary: subject || "E-mail feldolgozása",
+          action_items: "Manuális felülvizsgálat szükséges",
+          priority: "Közepes",
+          priority_reason: "AI parse error, requires manual review",
+          reply_draft: null
+        };
+      }
 
-    const baseSummary = result.summary || "Nem sikerült összefoglalót készíteni.";
-    const actionItems = result.action_items || "";
-    if (actionItems) {
-      const itemsFormatted = Array.isArray(actionItems)
-        ? actionItems.map((item: string) => `- ${item}`).join("\n")
-        : String(actionItems);
-      aiSummary = `${baseSummary}\n\nTeendők:\n${itemsFormatted}`;
-    } else {
-      aiSummary = baseSummary;
-    }
+      const baseSummary = result.summary || "Nem sikerült összefoglalót készíteni.";
+      const actionItems = result.action_items || "";
+      if (actionItems) {
+        const itemsFormatted = Array.isArray(actionItems)
+          ? actionItems.map((item: string) => `- ${item}`).join("\n")
+          : String(actionItems);
+        aiSummary = `${baseSummary}\n\nTeendők:\n${itemsFormatted}`;
+      } else {
+        aiSummary = baseSummary;
+      }
 
-    aiPriorityReason = result.priority_reason || "";
-    const aiPriorityStr = result.priority || "Közepes";
-    if (aiPriorityStr === "Sürgős") {
-      priorityNum = 5;
-    } else if (aiPriorityStr === "Közepes") {
+      aiPriorityReason = result.priority_reason || "";
+      const aiPriorityStr = result.priority || "Közepes";
+      if (aiPriorityStr === "Sürgős") {
+        priorityNum = 5;
+      } else if (aiPriorityStr === "Közepes") {
+        priorityNum = 3;
+      } else if (aiPriorityStr === "Alacsony") {
+        priorityNum = 2;
+      }
+
+      aiReplyDraft = result.reply_draft || null;
+    } catch (aiErr) {
+      logger.error(`processEmailInternally: AI task generation error for ${userEmail}:`, aiErr);
+      // Fallback to default manual review task on AI error
+      aiSummary = `${subject || "E-mail feldolgozása"}\n\nManuális felülvizsgálat szükséges (AI hiba)`;
+      aiPriorityReason = "AI processing error, requires manual review";
       priorityNum = 3;
-    } else if (aiPriorityStr === "Alacsony") {
-      priorityNum = 2;
+      aiReplyDraft = null;
     }
 
-    aiReplyDraft = result.reply_draft || null;
-  } catch (aiErr) {
-    logger.error(`processEmailInternally: AI task generation error for ${userEmail}:`, aiErr);
-    // Fallback to default manual review task on AI error
-    aiSummary = `${subject || "E-mail feldolgozása"}\n\nManuális felülvizsgálat szükséges (AI hiba)`;
-    aiPriorityReason = "AI processing error, requires manual review";
-    priorityNum = 3;
-    aiReplyDraft = null;
+    // Create task in the tasks collection
+    const nextStep = aiReplyDraft ? "AI választervezet felülvizsgálata" : "Manuális válasz írása szükséges";
+    const taskRef = await db.collection("tasks").add({
+      category: "E-mail",
+      summary: subject,
+      next_step: nextStep,
+      priority: priorityNum,
+      received_at: emailData.received_at || new Date().toISOString(),
+      sender,
+      subject,
+      user_email: userEmail,
+      user_id: emailData.user_id || "",
+      status: "active",
+      archivedAt: null,
+      ai_status: "pending_review",
+      ai_reply: aiReplyDraft,
+      ai_summary: aiSummary,
+      ai_priority_reason: aiPriorityReason,
+      textContent,
+      source_mailbox: emailData.source_mailbox || "",
+      received_via: emailData.received_via || "imap",
+      sourceEmailId: emailId,
+    });
+
+    // Mark the email as processed
+    await emailRef.update({ status: "processed" });
+
+    return { status: "success", taskId: taskRef.id };
+  } catch (executionErr: unknown) {
+    // Rollback the counter increment in case of failure
+    logger.error(`processEmailInternally: Execution error, rolling back increment:`, executionErr);
+    try {
+      await db.collection("users").doc(userEmail).update({
+        processedEmailsThisMonth: admin.firestore.FieldValue.increment(-1)
+      });
+    } catch (rollbackErr) {
+      logger.error(`processEmailInternally: Rollback failed for user ${userEmail}:`, rollbackErr);
+    }
+    throw executionErr;
   }
-
-  // Create task in the tasks collection
-  const nextStep = aiReplyDraft ? "AI választervezet felülvizsgálata" : "Manuális válasz írása szükséges";
-  const taskRef = await db.collection("tasks").add({
-    category: "E-mail",
-    summary: subject,
-    next_step: nextStep,
-    priority: priorityNum,
-    received_at: emailData.received_at || new Date().toISOString(),
-    sender,
-    subject,
-    user_email: userEmail,
-    user_id: emailData.user_id || "",
-    status: "active",
-    archivedAt: null,
-    ai_status: "pending_review",
-    ai_reply: aiReplyDraft,
-    ai_summary: aiSummary,
-    ai_priority_reason: aiPriorityReason,
-    textContent,
-    source_mailbox: emailData.source_mailbox || "",
-    received_via: emailData.received_via || "imap",
-    sourceEmailId: emailId,
-  });
-
-  // Mark the email as processed
-  await emailRef.update({ status: "processed" });
-
-  // Increment user's monthly processed email counter atomically
-  await db.collection("users").doc(userEmail).update({
-    processedEmailsThisMonth: admin.firestore.FieldValue.increment(1)
-  });
-
-  return { status: "success", taskId: taskRef.id };
 }
 
 /**
@@ -1264,14 +1501,130 @@ const deleteEmailLogic: express.RequestHandler = async (req, res) => {
   }
 };
 
+const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  if (!sig || typeof sig !== "string") {
+    res.status(400).send("Webhook Error: Missing stripe-signature header");
+    return;
+  }
+
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET || "";
+  if (!endpointSecret) {
+    logger.error("stripeWebhookHandler: STRIPE_WEBHOOK_SECRET environment variable is not configured");
+    res.status(500).send("Webhook Configuration Error");
+    return;
+  }
+
+  let event: Stripe.Event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("stripeWebhookHandler: Signature verification failed:", errMsg);
+    res.status(400).send(`Webhook Error: ${errMsg}`);
+    return;
+  }
+
+  logger.info(`stripeWebhookHandler: Received Stripe event: ${event.type}`);
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session;
+        const customerEmail = session.customer_details?.email || session.metadata?.email || session.metadata?.userEmail;
+        if (!customerEmail) {
+          logger.warn("stripeWebhookHandler: No customer email resolved for checkout.session.completed");
+          break;
+        }
+
+        const tier = (session.metadata?.tier || "basic") as 'basic' | 'pro' | 'ultra';
+
+        logger.info(`stripeWebhookHandler: Setting user ${customerEmail} subscription to active, tier ${tier}`);
+        await db.collection("users").doc(customerEmail).set({
+          subscriptionStatus: "active",
+          tier: tier,
+          processedEmailsThisMonth: 0
+        }, { merge: true });
+        break;
+      }
+
+      case "customer.subscription.created": {
+        const subscription = event.data.object as Stripe.Subscription;
+        const customerEmail = subscription.metadata?.email || subscription.metadata?.userEmail;
+        if (!customerEmail) {
+          logger.warn("stripeWebhookHandler: No email metadata resolved for customer.subscription.created");
+          break;
+        }
+
+        const tier = (subscription.metadata?.tier || "basic") as 'basic' | 'pro' | 'ultra';
+
+        logger.info(`stripeWebhookHandler: Setting user ${customerEmail} subscription to active, tier ${tier}`);
+        await db.collection("users").doc(customerEmail).set({
+          subscriptionStatus: "active",
+          tier: tier,
+          processedEmailsThisMonth: 0
+        }, { merge: true });
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object as Stripe.Subscription;
+        const customerEmail = subscription.metadata?.email || subscription.metadata?.userEmail;
+        if (!customerEmail) {
+          logger.warn("stripeWebhookHandler: No email metadata resolved for customer.subscription.deleted");
+          break;
+        }
+
+        logger.info(`stripeWebhookHandler: Degrading subscription state for user ${customerEmail} due to deletion`);
+        await db.collection("users").doc(customerEmail).set({
+          subscriptionStatus: "inactive",
+          tier: "none"
+        }, { merge: true });
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object as Stripe.Invoice;
+        const customerEmail = invoice.customer_email || invoice.metadata?.email || invoice.metadata?.userEmail;
+        if (!customerEmail) {
+          logger.warn("stripeWebhookHandler: No email metadata resolved for invoice.payment_failed");
+          break;
+        }
+
+        logger.info(`stripeWebhookHandler: Suspending subscription for user ${customerEmail} due to failed invoice payment`);
+        await db.collection("users").doc(customerEmail).set({
+          subscriptionStatus: "suspended",
+          tier: "none"
+        }, { merge: true });
+        break;
+      }
+
+      default:
+        logger.info(`stripeWebhookHandler: Unhandled event type: ${event.type}`);
+    }
+
+    res.status(200).json({ received: true });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error(`stripeWebhookHandler: Error processing event ${event.type}:`, errMsg);
+    res.status(500).send(`Internal Server Error: ${errMsg}`);
+  }
+};
+
 // ─── Central Express Routing Subsystem ──────────────────────────────────────
 
 const app = express();
 app.use(cors({ origin: true }));
+
+// Stripe webhook requires the raw request body to verify the signature integrity.
+// Place it before express.json() parser so the buffer remains untouched.
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
+
 app.use(express.json());
 
 const registeredRoutes = [
-  "/handleIncomingEmail",
+  "/webhook/cloudflare-inbound",
   "/improveEmailDraft",
   "/sendManualEmail",
   "/archiveTask",
@@ -1292,20 +1645,21 @@ app.use((req, res, next) => {
   next();
 });
 
-app.post("/handleIncomingEmail", handleIncomingEmailLogic);
-app.post("/improveEmailDraft", improveEmailDraftLogic);
+// Registering POST routes with application-layer rate limiter on critical ingress paths
+app.post("/webhook/cloudflare-inbound", limiter, cloudflareInboundWebhookLogic);
+app.post("/improveEmailDraft", limiter, improveEmailDraftLogic);
 app.post("/sendManualEmail", sendManualEmailLogic);
 app.post("/archiveTask", archiveTaskLogic);
 app.post("/restoreTask", restoreTaskLogic);
 app.post("/handleFeedbackSubmit", handleFeedbackSubmitLogic);
 app.post("/sendAiReply", sendAiReplyLogic);
 app.post("/processEmailWithAi", processEmailWithAiLogic);
-app.post("/verifySubscription", verifySubscriptionLogic);
+app.post("/verifySubscription", limiter, verifySubscriptionLogic);
 app.delete("/emails/:emailId", deleteEmailLogic);
 
 export const api = onRequest({
   cors: true,
-  secrets: ["OPENAI_API_KEY", "SERVER_WEBHOOK_KEY"],
+  secrets: ["OPENAI_API_KEY", "SERVER_WEBHOOK_KEY", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "CLOUDFLARE_WORKER_SECRET", "ENCRYPTION_KEY"],
   maxInstances: 10,
   invoker: "public",
 }, app);
