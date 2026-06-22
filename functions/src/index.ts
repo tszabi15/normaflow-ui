@@ -13,6 +13,7 @@ import rateLimit from "express-rate-limit";
 import Stripe from "stripe";
 import { ImapFlow } from "imapflow";
 import { Readable } from "stream";
+import PostalMime from 'postal-mime';
 
 // Set global options for the functions (max instances for budget/cost control)
 setGlobalOptions({ maxInstances: 10 });
@@ -21,10 +22,16 @@ setGlobalOptions({ maxInstances: 10 });
 admin.initializeApp();
 const db = getFirestore();
 
-// Initialize Stripe Node SDK
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "rk_test_dummy", {
-  apiVersion: "2026-05-27.dahlia" as any,
-});
+// Initialize Stripe Node SDK lazily to prevent top-level container crashes on cold starts
+let stripeInstance: Stripe | null = null;
+function getStripe(): Stripe {
+  if (!stripeInstance) {
+    stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
+      apiVersion: "2026-05-27.dahlia" as any,
+    });
+  }
+  return stripeInstance;
+}
 
 // Application-layer Rate Limiter (Anti-Denial of Wallet)
 // Throttle requests per window Ms per unique target IP
@@ -202,12 +209,9 @@ async function resolveSmtpConfig(userEmail: string, preferredEmail?: string): Pr
  * Input: POST JSON payload: { extractedUid, sender, subject, textContent }
  */
 interface CloudflareInboundRequest {
-  extractedUid: string;
-  sender?: string;
   from?: string;
-  subject: string;
-  textContent: string;
-  attachments?: any[];
+  to?: string;
+  raw?: string;
 }
 
 const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): Promise<void> => {
@@ -219,7 +223,7 @@ const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): 
     }
 
     // Secure the route with header validation handshake
-    const signature = req.headers["x-normaflow-signature"];
+    const signature = req.headers["x-worker-secret"];
     const secret = process.env.CLOUDFLARE_WORKER_SECRET || "";
     if (!secret || signature !== secret) {
       logger.warn("cloudflareInboundWebhook: Unauthorized request signature.");
@@ -227,13 +231,16 @@ const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): 
       return;
     }
 
-    const { extractedUid, sender, from, subject, textContent, attachments } = req.body as CloudflareInboundRequest;
-    const rawFrom = from || sender || "";
-    if (!extractedUid || !rawFrom || !subject || !textContent) {
-      logger.warn("cloudflareInboundWebhook: Missing required payload properties");
+    const { from, to, raw } = req.body as CloudflareInboundRequest;
+    if (!to || !raw) {
+      logger.warn("cloudflareInboundWebhook: Missing required to or raw payload properties");
       res.status(400).json({ error: "Bad Request: Missing parameters" });
       return;
     }
+
+    // Target UID Extraction
+    const toAddress = to || "";
+    const extractedUid = toAddress.split('@')[0].trim();
 
     // Map extractedUid to registered email address
     const userQuery = await db.collection("users").where("uid", "==", extractedUid).limit(1).get();
@@ -246,26 +253,39 @@ const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): 
     const userEmail = userDoc.id;
 
     logger.info(`cloudflareInboundWebhook: Ingesting email for UID ${extractedUid} (${userEmail})`);
-    
+
+    // Server-Side Parsing
+    const parser = new PostalMime();
+    const parsedEmail = await parser.parse(raw);
+
+    const rawFrom = from || parsedEmail.from?.address || "";
     let cleanSender = rawFrom.trim();
     if (cleanSender.includes("<")) {
       const match = cleanSender.match(/<([^>]+)>/);
-      if (match && match[1]) cleanSender = match[1].trim();
+      if (match && match[1]) {
+        cleanSender = match[1].trim();
+      }
     }
     cleanSender = cleanSender.toLowerCase().trim();
 
-    // Slice input to a strict maximum of 6000 characters
-    const slicedText = textContent.slice(0, 6000);
+    // Explicit Attribute Mapping
+    const textContent = (parsedEmail.text || parsedEmail.html || "Üres levéltörzs").slice(0, 6000);
+
+    const attachments = (parsedEmail.attachments || []).map((att: any) => ({
+      filename: att.filename || "unnamed_file",
+      contentType: att.mimeType || "application/octet-stream",
+      content: Buffer.from(att.content).toString("base64")
+    }));
 
     const emailDocRef = await db.collection("emails").add({
       user_id: extractedUid,
       sender: cleanSender,
-      subject: subject || "Nincs tárgy",
-      textContent: slicedText,
+      subject: parsedEmail.subject || "Nincs tárgy",
+      textContent: textContent,
       received_at: new Date().toISOString(),
       status: "unread",
       received_via: "cloudflare_worker",
-      attachments: attachments || []
+      attachments: attachments
     });
 
     // Autonomous Trigger Hook (Transactional Quota Verification and AI Processing)
@@ -988,7 +1008,7 @@ const createCheckoutSessionLogic: express.RequestHandler = async (req, res) => {
     // Dynamic price calculation for localized subscriptions
     const unitAmount = tier === "basic" ? 899000 : tier === "pro" ? 1499000 : 3999000;
 
-    const session = await stripe.checkout.sessions.create({
+    const session = await getStripe().checkout.sessions.create({
       payment_method_types: ["card"],
       line_items: [
         {
@@ -1009,6 +1029,7 @@ const createCheckoutSessionLogic: express.RequestHandler = async (req, res) => {
       cancel_url: `${req.headers.origin}/`,
       customer_email: authResult.email,
       metadata: {
+        uid: authResult.uid,
         email: authResult.email,
         userEmail: authResult.email,
         tier: tier
@@ -1789,7 +1810,7 @@ const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
   let event: Stripe.Event;
 
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    event = getStripe().webhooks.constructEvent(req.body, sig, endpointSecret);
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error("stripeWebhookHandler: Signature verification failed:", errMsg);
@@ -2016,7 +2037,13 @@ app.delete("/emails/:emailId", deleteEmailLogic);
 
 export const api = onRequest({
   cors: true,
-  secrets: ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "ENCRYPTION_KEY", "CLOUDFLARE_WORKER_SECRET", "OPENAI_API_KEY"],
+  secrets: [
+    "STRIPE_SECRET_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "ENCRYPTION_KEY",
+    "CLOUDFLARE_WORKER_SECRET",
+    "OPENAI_API_KEY"
+  ],
   timeoutSeconds: 60,
   memory: "512MiB"
 }, app);
