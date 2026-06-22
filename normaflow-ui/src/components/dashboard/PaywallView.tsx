@@ -16,14 +16,14 @@ const PRICING_PLANS: PricingPlan[] = [
   {
     tier: 'basic',
     name: 'Basic',
-    price: '9.990',
+    price: '8.990',
     emails: 500,
     features: ['500 e-mail / hó', 'AI feladat összegzés', 'Prioritás-sorrendezés', '30 napos kuka'],
   },
   {
     tier: 'pro',
     name: 'Pro',
-    price: '19.990',
+    price: '14.990',
     emails: 1500,
     features: ['1500 e-mail / hó', 'AI auto-választervezet', 'Ügyfél fehérlista', 'Prioritás riasztások'],
     highlighted: true,

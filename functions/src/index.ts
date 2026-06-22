@@ -22,7 +22,9 @@ admin.initializeApp();
 const db = getFirestore();
 
 // Initialize Stripe Node SDK
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "rk_test_dummy", {
+  apiVersion: "2026-05-27.dahlia" as any,
+});
 
 // Application-layer Rate Limiter (Anti-Denial of Wallet)
 // Throttle requests per window Ms per unique target IP
@@ -201,9 +203,11 @@ async function resolveSmtpConfig(userEmail: string, preferredEmail?: string): Pr
  */
 interface CloudflareInboundRequest {
   extractedUid: string;
-  sender: string;
+  sender?: string;
+  from?: string;
   subject: string;
   textContent: string;
+  attachments?: any[];
 }
 
 const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): Promise<void> => {
@@ -223,8 +227,9 @@ const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): 
       return;
     }
 
-    const { extractedUid, sender, subject, textContent } = req.body as CloudflareInboundRequest;
-    if (!extractedUid || !sender || !subject || !textContent) {
+    const { extractedUid, sender, from, subject, textContent, attachments } = req.body as CloudflareInboundRequest;
+    const rawFrom = from || sender || "";
+    if (!extractedUid || !rawFrom || !subject || !textContent) {
       logger.warn("cloudflareInboundWebhook: Missing required payload properties");
       res.status(400).json({ error: "Bad Request: Missing parameters" });
       return;
@@ -242,7 +247,7 @@ const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): 
 
     logger.info(`cloudflareInboundWebhook: Ingesting email for UID ${extractedUid} (${userEmail})`);
     
-    let cleanSender = sender.trim();
+    let cleanSender = rawFrom.trim();
     if (cleanSender.includes("<")) {
       const match = cleanSender.match(/<([^>]+)>/);
       if (match && match[1]) cleanSender = match[1].trim();
@@ -259,7 +264,8 @@ const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): 
       textContent: slicedText,
       received_at: new Date().toISOString(),
       status: "unread",
-      received_via: "cloudflare_worker"
+      received_via: "cloudflare_worker",
+      attachments: attachments || []
     });
 
     // Autonomous Trigger Hook (Transactional Quota Verification and AI Processing)
@@ -960,6 +966,13 @@ const createCheckoutSessionLogic: express.RequestHandler = async (req, res) => {
       return;
     }
 
+    const stripeKey = process.env.STRIPE_SECRET_KEY || "";
+    if (stripeKey && stripeKey !== "sk_test_dummy" && !stripeKey.startsWith("rk_")) {
+      logger.error("Stripe Security Violation: Restricted API Key (RAK) must be used.");
+      res.status(403).json({ error: "Forbidden", message: "Stripe Restricted API Key is required." });
+      return;
+    }
+
     const { tier } = req.body as { tier?: string };
     if (!tier || !["basic", "pro", "ultra"].includes(tier)) {
       res.status(400).json({ error: "Bad Request: Invalid or missing tier" });
@@ -973,7 +986,7 @@ const createCheckoutSessionLogic: express.RequestHandler = async (req, res) => {
     }
 
     // Dynamic price calculation for localized subscriptions
-    const unitAmount = tier === "basic" ? 300000 : tier === "pro" ? 600000 : 1200000;
+    const unitAmount = tier === "basic" ? 899000 : tier === "pro" ? 1499000 : 3999000;
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -1283,6 +1296,61 @@ const restoreTaskLogic: express.RequestHandler = async (req, res) => {
  * Can be called from both the HTTP endpoint and the background sync hook.
  * Returns { status, taskId? } or throws on error.
  */
+async function parseAttachmentContent(attachment: { filename: string; contentType: string; content: string }): Promise<string> {
+  const filename = attachment.filename || 'unknown';
+  const contentType = attachment.contentType || '';
+  const base64Content = attachment.content || '';
+
+  if (!base64Content) return `[Fájl: ${filename} (üres)]`;
+
+  try {
+    const buffer = Buffer.from(base64Content, 'base64');
+
+    if (contentType.includes('text/') || filename.endsWith('.txt') || filename.endsWith('.csv')) {
+      const text = buffer.toString('utf8');
+      return `[Fájl: ${filename} (Text/CSV tartalom)]\n${text}\n`;
+    }
+
+    if (contentType === 'application/pdf' || filename.endsWith('.pdf')) {
+      const pdf = require('pdf-parse');
+      const parsed = await pdf(buffer);
+      return `[Fájl: ${filename} (PDF tartalom)]\n${parsed.text}\n`;
+    }
+
+    if (filename.endsWith('.xlsx') || filename.endsWith('.xls') || contentType.includes('spreadsheet') || contentType.includes('excel')) {
+      const XLSX = require('xlsx');
+      const workbook = XLSX.read(buffer, { type: 'buffer' });
+      let extracted = `[Fájl: ${filename} (Excel táblázat tartalom)]\n`;
+      workbook.SheetNames.forEach((sheetName: string) => {
+        const worksheet = workbook.Sheets[sheetName];
+        const csv = XLSX.utils.sheet_to_csv(worksheet);
+        extracted += `Munkalap: ${sheetName}\n${csv}\n`;
+      });
+      return extracted;
+    }
+
+    if (filename.endsWith('.docx') || contentType.includes('word') || contentType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      const mammoth = require('mammoth');
+      const parsed = await mammoth.extractRawText({ buffer: buffer });
+      return `[Fájl: ${filename} (Word dokumentum tartalom)]\n${parsed.value}\n`;
+    }
+
+    if (contentType.startsWith('image/')) {
+      return `[Fájl: ${filename} (Kép formátum - közvetlenül a Vision modell dolgozza fel)]\n`;
+    }
+
+    return `[Fájl: ${filename} (Nem támogatott formátum helyi feldolgozáshoz: ${contentType})]`;
+  } catch (err: any) {
+    logger.error(`Nem sikerült a(z) ${filename} melléklet feldolgozása:`, err);
+    return `[Fájl: ${filename} (Hiba a feldolgozás során: ${err.message || err})]`;
+  }
+}
+
+/**
+ * Internal helper: 2-phase AI processing for a single email document.
+ * Can be called from both the HTTP endpoint and the background sync hook.
+ * Returns { status, taskId? } or throws on error.
+ */
 async function processEmailInternally(emailId: string, userEmail: string): Promise<{ status: string; taskId?: string; reason?: string }> {
   const emailRef = db.collection("emails").doc(emailId);
   const emailDoc = await emailRef.get();
@@ -1382,6 +1450,22 @@ async function processEmailInternally(emailId: string, userEmail: string): Promi
 
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+  // Gather attachments bound to this email
+  const attachments = emailData.attachments || [];
+  let extractedAttachmentsString = "";
+  const visionImages: { contentType: string; content: string }[] = [];
+
+  for (const attachment of attachments) {
+    if (attachment.contentType && attachment.contentType.startsWith('image/')) {
+      visionImages.push({
+        contentType: attachment.contentType,
+        content: attachment.content
+      });
+    }
+    const parsedText = await parseAttachmentContent(attachment);
+    extractedAttachmentsString += parsedText + "\n";
+  }
+
   try {
     // ── PHASE 1: AI Pre-Filter ──────────────────────────────────────────────
     if (exclusionRules.trim()) {
@@ -1456,13 +1540,29 @@ Feladó: ${sender}
 Tárgy: ${subject}
 Dátum: ${emailData.received_at || new Date().toISOString()}
 Levél szövege: 
-${textContent}`;
+${textContent}
+
+[ATTACHED FILES AND PARSED CONTENT]
+${extractedAttachmentsString || "No attachments provided or processed."}`;
+
+      const userContent: any[] = [
+        { type: "text", text: userPrompt }
+      ];
+
+      for (const img of visionImages) {
+        userContent.push({
+          type: "image_url",
+          image_url: {
+            url: `data:${img.contentType};base64,${img.content}`
+          }
+        });
+      }
 
       const response = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
+          { role: "user", content: userContent as any },
         ],
         response_format: { type: "json_object" },
         max_tokens: 1000,
@@ -1666,6 +1766,13 @@ const deleteEmailLogic: express.RequestHandler = async (req, res) => {
 };
 
 const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
+  const stripeKey = process.env.STRIPE_SECRET_KEY || "";
+  if (stripeKey && stripeKey !== "sk_test_dummy" && !stripeKey.startsWith("rk_")) {
+    logger.error("Stripe Security Violation: Restricted API Key (RAK) must be used.");
+    res.status(403).send("Webhook Security Error: Stripe Restricted API Key is required.");
+    return;
+  }
+
   const sig = req.headers["stripe-signature"];
   if (!sig || typeof sig !== "string") {
     res.status(400).send("Webhook Error: Missing stripe-signature header");
@@ -1702,7 +1809,14 @@ const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
           break;
         }
 
-        const tier = (session.metadata?.tier || "basic") as 'basic' | 'pro' | 'ultra';
+        let tier = (session.metadata?.tier) as 'basic' | 'pro' | 'ultra' | undefined;
+        if (!tier) {
+          const amount = session.amount_total;
+          if (amount === 899000) tier = "basic";
+          else if (amount === 1499000) tier = "pro";
+          else if (amount === 3999000) tier = "ultra";
+        }
+        if (!tier) tier = "basic";
 
         // Retrieve existing user document to check previous status and tier
         const userDoc = await db.collection("users").doc(customerEmail).get();
@@ -1755,7 +1869,14 @@ const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
           break;
         }
 
-        const tier = (subscription.metadata?.tier || "basic") as 'basic' | 'pro' | 'ultra';
+        let tier = (subscription.metadata?.tier) as 'basic' | 'pro' | 'ultra' | undefined;
+        if (!tier) {
+          const amount = subscription.items.data[0]?.price?.unit_amount;
+          if (amount === 899000) tier = "basic";
+          else if (amount === 1499000) tier = "pro";
+          else if (amount === 3999000) tier = "ultra";
+        }
+        if (!tier) tier = "basic";
 
         // Retrieve existing user document to check previous status and tier
         const userDoc = await db.collection("users").doc(customerEmail).get();
@@ -1895,7 +2016,7 @@ app.delete("/emails/:emailId", deleteEmailLogic);
 
 export const api = onRequest({
   cors: true,
-  secrets: ["OPENAI_API_KEY", "SERVER_WEBHOOK_KEY", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "CLOUDFLARE_WORKER_SECRET", "ENCRYPTION_KEY"],
-  maxInstances: 10,
-  invoker: "public",
+  secrets: ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "ENCRYPTION_KEY", "CLOUDFLARE_WORKER_SECRET", "OPENAI_API_KEY"],
+  timeoutSeconds: 60,
+  memory: "512MiB"
 }, app);
