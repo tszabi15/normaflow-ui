@@ -690,6 +690,9 @@ function WhitelistSettingsCard({
       <div className="mt-4 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4 flex gap-3">
         <Mail className="h-5 w-5 shrink-0 text-indigo-400 mt-0.5" />
         <div className="text-xs text-slate-300 leading-relaxed">
+          <p className="mb-2">
+            A fehérlista ellenőrzés mind az egyedi Cloudflare átirányítási aldomainre, mind a közvetlenül szinkronizált IMAP vállalati postafiókokra vonatkozik.
+          </p>
           {enforceWhitelist ? (
             <p>
               <strong>Szigorú fehérlista aktív:</strong> Az AI csak akkor küld automatikus választervezetet, ha a feladó e-mail címe szerepel az alábbi listában. Bárki más által küldött levelet a rendszer feldolgozás nélkül átugrik.
@@ -827,7 +830,6 @@ export default function App() {
     setAutomationEnabled(false)
     setEnforceWhitelist(true)
   }
-
   const handleSelectTier = async (selectedTier: SubscriptionTier) => {
     if (!user?.email) return
     try {
@@ -835,9 +837,7 @@ export default function App() {
       if (!firebaseUser) throw new Error('Nem bejelentkezett felhasználó')
       const token = await firebaseUser.getIdToken()
 
-      // Hardening: Removed client-side direct writes to users/{userId} subscription status/tier
-      // Bypasses local setDoc with a secure backend verify/checkout session network call.
-      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/verifySubscription`, {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/createCheckoutSession`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -845,23 +845,19 @@ export default function App() {
         },
         body: JSON.stringify({
           tier: selectedTier,
-          stripeSessionId: `mock_checkout_session_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
         }),
       })
 
       if (!response.ok) {
-        throw new Error('Sikertelen előfizetés frissítés.')
+        throw new Error('Sikertelen előfizetési munkamenet indítás.')
       }
 
-      const toastId = generateId()
-      setToasts((prev) => [
-        ...prev,
-        {
-          id: toastId,
-          message: 'Előfizetés kezdeményezve',
-          taskSummary: `Csomag: ${selectedTier}. A frissítés hamarosan élesedik.`,
-        },
-      ])
+      const { url } = await response.json()
+      if (url) {
+        window.location.href = url
+      } else {
+        throw new Error('Nem érkezett érvényes fizetési cím a szervertől.')
+      }
     } catch (err: any) {
       console.error('Error starting subscription checkout:', err)
       alert('Hiba az előfizetés során: ' + err.message)

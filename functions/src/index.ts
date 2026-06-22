@@ -370,7 +370,7 @@ export const scheduledImapPolling = onSchedule({
                 logger.info(`scheduledImapPolling: Found ${sequenceNumbers.length} unseen messages for ${emailAddress}`);
 
                 for (const seq of sequenceNumbers) {
-                  const message = await client.fetchOne(String(seq), { envelope: true });
+                  const message = await client.fetchOne(String(seq), { envelope: true, uid: true });
                   if (!message) continue;
 
                   let textContent = "";
@@ -405,23 +405,57 @@ export const scheduledImapPolling = onSchedule({
                   const subject = message.envelope?.subject || "Nincs tárgy";
                   const textContentSliced = textContent.slice(0, 6000);
 
-                  const emailDocRef = await db.collection("emails").add({
-                    user_id: userId,
-                    sender: cleanSender,
-                    subject: subject,
-                    textContent: textContentSliced,
-                    received_at: new Date().toISOString(),
-                    status: "unread",
-                    received_via: "imap"
-                  });
+                  let emailDocRef: admin.firestore.DocumentReference | null = null;
+                  let existingDocId: string | null = null;
+                  let existingStatus = "unread";
+
+                  if (message.uid) {
+                    const existingQuery = await db.collection("emails")
+                      .where("user_id", "==", userId)
+                      .where("received_via", "==", "imap")
+                      .where("imap_uid", "==", message.uid)
+                      .where("source_mailbox", "==", emailAddress)
+                      .limit(1)
+                      .get();
+
+                    if (!existingQuery.empty) {
+                      const existingDoc = existingQuery.docs[0];
+                      emailDocRef = existingDoc.ref;
+                      existingDocId = existingDoc.id;
+                      existingStatus = existingDoc.data().status || "unread";
+                      logger.info(`scheduledImapPolling: Message UID ${message.uid} already exists as document ${existingDocId} with status ${existingStatus}`);
+                    }
+                  }
+
+                  if (!emailDocRef) {
+                    emailDocRef = await db.collection("emails").add({
+                      user_id: userId,
+                      sender: cleanSender,
+                      subject: subject,
+                      textContent: textContentSliced,
+                      received_at: new Date().toISOString(),
+                      status: "unread",
+                      received_via: "imap",
+                      imap_uid: message.uid || null,
+                      source_mailbox: emailAddress
+                    });
+                  } else {
+                    if (existingStatus === "processed" || existingStatus === "filtered") {
+                      logger.info(`scheduledImapPolling: Message ${existingDocId} was already processed/filtered. Ensuring it is marked Seen on IMAP.`);
+                      await client.messageFlagsAdd(String(seq), ["\\Seen"]);
+                      continue;
+                    }
+                  }
 
                   let shouldMarkSeen = true;
+                  let processResult: { status: string; reason?: string } = { status: "success" };
 
                   try {
                     const aiConfigDoc = await db.doc(`users/${userId}/settings/ai_configuration`).get();
                     if (aiConfigDoc.exists && aiConfigDoc.data()?.globalAutomationEnabled === true) {
                       logger.info(`scheduledImapPolling: Auto-processing email ${emailDocRef.id} for user ${userEmail}`);
                       const result = await processEmailInternally(emailDocRef.id, userEmail);
+                      processResult = result;
                       if (result.status !== "success" && result.status !== "filtered") {
                         shouldMarkSeen = false;
                         logger.warn(`scheduledImapPolling: AI processing not successful (status: ${result.status}). Leaving email as unseen.`);
@@ -431,14 +465,18 @@ export const scheduledImapPolling = onSchedule({
                     shouldMarkSeen = false;
                     const autoErrMsg = autoErr instanceof Error ? autoErr.message : String(autoErr);
                     logger.error(`scheduledImapPolling: Automatic processing failed for email ${emailDocRef.id}:`, autoErrMsg);
+                    processResult = { status: "failed", reason: autoErrMsg };
                   }
 
                   if (shouldMarkSeen) {
                     await client.messageFlagsAdd(String(seq), ["\\Seen"]);
                   } else {
-                    // Delete the email document to prevent duplicates on retry
-                    logger.info(`scheduledImapPolling: Cleaning up email doc ${emailDocRef.id} to avoid duplication on next retry`);
-                    await emailDocRef.delete();
+                    // Update document status to reflect failure/quota exceeded instead of deleting it
+                    logger.info(`scheduledImapPolling: Updating email doc ${emailDocRef.id} to failure/quota state`);
+                    await emailDocRef.update({
+                      status: processResult.status === "quota_exceeded" ? "quota_exceeded" : "failed",
+                      error_reason: processResult.reason || "AI processing cycle bypassed/failed"
+                    });
                   }
                 }
               } else {
@@ -855,6 +893,119 @@ const improveEmailDraftLogic: express.RequestHandler = async (req, res) => {
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error("Error in improveEmailDraft:", errMsg);
+    res.status(500).json({ error: "Internal Server Error", message: errMsg });
+  }
+};
+
+interface ConfigureEmailConnectionRequest {
+  email?: string;
+  password?: string;
+  imapHost?: string;
+  imapPort?: number;
+}
+
+const configureEmailConnectionLogic: express.RequestHandler = async (req, res) => {
+  try {
+    if (req.method === "OPTIONS") {
+      res.set("Access-Control-Allow-Origin", "*");
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.status(204).send("");
+      return;
+    }
+
+    const { email, password, imapHost, imapPort } = req.body as ConfigureEmailConnectionRequest;
+
+    if (!email || !password || !imapHost || !imapPort) {
+      res.status(400).json({ error: "Bad Request: email, password, imapHost and imapPort are required" });
+      return;
+    }
+
+    const authResult = await verifyAuthToken(req);
+    if (!authResult) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    // Encrypt password securely in-memory using process.env.ENCRYPTION_KEY
+    const encryptedPassword = encrypt(password);
+
+    await db.collection("users")
+      .doc(authResult.email)
+      .collection("email_connections")
+      .doc("imap")
+      .set({
+        email: email.trim(),
+        password: encryptedPassword,
+        imap_host: imapHost.trim(),
+        imap_port: Number(imapPort),
+        connected_at: new Date().toISOString()
+      });
+
+    res.status(200).json({ status: "success" });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("configureEmailConnectionLogic error:", errMsg);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+};
+
+const createCheckoutSessionLogic: express.RequestHandler = async (req, res) => {
+  try {
+    if (req.method === "OPTIONS") {
+      res.set("Access-Control-Allow-Origin", "*");
+      res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.status(204).send("");
+      return;
+    }
+
+    const { tier } = req.body as { tier?: string };
+    if (!tier || !["basic", "pro", "ultra"].includes(tier)) {
+      res.status(400).json({ error: "Bad Request: Invalid or missing tier" });
+      return;
+    }
+
+    const authResult = await verifyAuthToken(req);
+    if (!authResult) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    // Dynamic price calculation for localized subscriptions
+    const unitAmount = tier === "basic" ? 300000 : tier === "pro" ? 600000 : 1200000;
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "huf",
+            product_data: {
+              name: `NormaFlow ${tier.toUpperCase()}`,
+              description: `Havi hozzáférés a(z) ${tier} csomag funkcióihoz`,
+            },
+            unit_amount: unitAmount,
+            recurring: { interval: "month" },
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "subscription",
+      success_url: `${req.headers.origin}/?session_id={CHECKOUT_SESSION_ID}&tier=${tier}`,
+      cancel_url: `${req.headers.origin}/`,
+      customer_email: authResult.email,
+      metadata: {
+        email: authResult.email,
+        userEmail: authResult.email,
+        tier: tier
+      }
+    });
+
+    res.status(200).json({ url: session.url });
+  } catch (err: unknown) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error("createCheckoutSessionLogic error:", errMsg);
     res.status(500).json({ error: "Internal Server Error", message: errMsg });
   }
 };
@@ -1713,7 +1864,9 @@ const registeredRoutes = [
   "/handleFeedbackSubmit",
   "/sendAiReply",
   "/processEmailWithAi",
-  "/verifySubscription"
+  "/verifySubscription",
+  "/configureEmailConnection",
+  "/createCheckoutSession"
 ];
 
 app.use((req, res, next) => {
@@ -1736,6 +1889,8 @@ app.post("/handleFeedbackSubmit", handleFeedbackSubmitLogic);
 app.post("/sendAiReply", sendAiReplyLogic);
 app.post("/processEmailWithAi", processEmailWithAiLogic);
 app.post("/verifySubscription", limiter, verifySubscriptionLogic);
+app.post("/configureEmailConnection", configureEmailConnectionLogic);
+app.post("/createCheckoutSession", createCheckoutSessionLogic);
 app.delete("/emails/:emailId", deleteEmailLogic);
 
 export const api = onRequest({
