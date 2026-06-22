@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import {
   Mail,
   AlertTriangle,
@@ -786,10 +786,6 @@ export default function App() {
 
   // AI automation states
   const [activeTab, setActiveTab] = useState<'tasks' | 'inbox' | 'automation'>('tasks')
-  const [automationEnabled, setAutomationEnabled] = useState(false)
-  const [promptRules, setPromptRules] = useState(
-    'Ha az ügyfél számlát kér, válaszolj udvariasan, hogy feldolgozzuk és küldjük. Válasz végére írd oda: Üdvözlettel, NormaFlow Asszisztens.'
-  )
   const [enforceWhitelist, setEnforceWhitelist] = useState(true)
   
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false)
@@ -800,18 +796,6 @@ export default function App() {
   const handleWriteReply = (task: Task) => {
     setReplyTask(task)
   }
-
-  // Use refs to avoid resetting the simulation interval when rules change
-  const automationEnabledRef = useRef(automationEnabled)
-  const promptRulesRef = useRef(promptRules)
-
-  useEffect(() => {
-    automationEnabledRef.current = automationEnabled
-  }, [automationEnabled])
-
-  useEffect(() => {
-    promptRulesRef.current = promptRules
-  }, [promptRules])
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
@@ -827,7 +811,6 @@ export default function App() {
     setCompletingIds(new Set())
     setToasts([])
     setActiveTab('tasks')
-    setAutomationEnabled(false)
     setEnforceWhitelist(true)
   }
   const handleSelectTier = async (selectedTier: SubscriptionTier) => {
@@ -945,7 +928,7 @@ export default function App() {
   const handleToggleWhitelist = async (checked: boolean) => {
     if (!user?.email) return
     try {
-      const settingsRef = doc(db, `users/${user.email}/settings/auto_responder`)
+      const settingsRef = doc(db, `users/${user.email}/settings/ai_configuration`)
       await setDoc(settingsRef, {
         enforceWhitelist: checked
       }, { merge: true })
@@ -1061,16 +1044,12 @@ export default function App() {
   useEffect(() => {
     if (!hasAccess || !user?.email) return
 
-    const settingsRef = doc(db, `users/${user.email}/settings/auto_responder`)
+    const settingsRef = doc(db, `users/${user.email}/settings/ai_configuration`)
     const fetchSettings = async () => {
       try {
         const docSnap = await getDoc(settingsRef)
         if (docSnap.exists()) {
           const data = docSnap.data()
-          setAutomationEnabled(!!data.automationEnabled)
-          if (data.promptRules) {
-            setPromptRules(data.promptRules)
-          }
           setEnforceWhitelist(data.enforceWhitelist !== false)
         }
       } catch (err) {

@@ -290,7 +290,7 @@ const cloudflareInboundWebhookLogic: express.RequestHandler = async (req, res): 
 
     // Autonomous Trigger Hook (Transactional Quota Verification and AI Processing)
     try {
-      const aiConfigDoc = await db.doc(`users/${extractedUid}/settings/ai_configuration`).get();
+      const aiConfigDoc = await db.doc(`users/${userEmail}/settings/ai_configuration`).get();
       if (aiConfigDoc.exists && aiConfigDoc.data()?.globalAutomationEnabled === true) {
         logger.info(`cloudflareInboundWebhook: Auto-processing email ${emailDocRef.id} for user UID ${extractedUid}`);
         await processEmailInternally(emailDocRef.id, userEmail);
@@ -477,7 +477,7 @@ export const scheduledImapPolling = onSchedule({
                   let processResult: { status: string; reason?: string } = { status: "success" };
 
                   try {
-                    const aiConfigDoc = await db.doc(`users/${userId}/settings/ai_configuration`).get();
+                    const aiConfigDoc = await db.doc(`users/${userEmail}/settings/ai_configuration`).get();
                     if (aiConfigDoc.exists && aiConfigDoc.data()?.globalAutomationEnabled === true) {
                       logger.info(`scheduledImapPolling: Auto-processing email ${emailDocRef.id} for user ${userEmail}`);
                       const result = await processEmailInternally(emailDocRef.id, userEmail);
@@ -1393,14 +1393,12 @@ async function processEmailInternally(emailId: string, userEmail: string): Promi
   let customPriorityRules = "";
   let customReplyRules = "";
   let exclusionRules = "";
-  if (userId) {
-    const aiConfigDoc = await db.doc(`users/${userId}/settings/ai_configuration`).get();
-    if (aiConfigDoc.exists) {
-      const data = aiConfigDoc.data();
-      customPriorityRules = data?.customPriorityRules || "";
-      customReplyRules = data?.customReplyRules || "";
-      exclusionRules = data?.exclusionRules || "";
-    }
+  const aiConfigDoc = await db.doc(`users/${userEmail}/settings/ai_configuration`).get();
+  if (aiConfigDoc.exists) {
+    const data = aiConfigDoc.data();
+    customPriorityRules = data?.customPriorityRules || "";
+    customReplyRules = data?.customReplyRules || "";
+    exclusionRules = data?.exclusionRules || "";
   }
 
   const sender = emailData.sender || "";
@@ -1810,7 +1808,7 @@ const stripeWebhookHandler: express.RequestHandler = async (req, res) => {
   let event: Stripe.Event;
 
   try {
-    event = getStripe().webhooks.constructEvent(req.body, sig, endpointSecret);
+    event = getStripe().webhooks.constructEvent((req as any).rawBody, sig, endpointSecret);
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
     logger.error("stripeWebhookHandler: Signature verification failed:", errMsg);
@@ -1998,7 +1996,7 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), stripeWeb
 app.use(express.json());
 
 const registeredRoutes = [
-  "/webhook/cloudflare-inbound",
+  "/cloudflare-inbound",
   "/improveEmailDraft",
   "/sendManualEmail",
   "/archiveTask",
@@ -2022,7 +2020,7 @@ app.use((req, res, next) => {
 });
 
 // Registering POST routes with application-layer rate limiter on critical ingress paths
-app.post("/webhook/cloudflare-inbound", limiter, cloudflareInboundWebhookLogic);
+app.post("/cloudflare-inbound", limiter, cloudflareInboundWebhookLogic);
 app.post("/improveEmailDraft", limiter, improveEmailDraftLogic);
 app.post("/sendManualEmail", sendManualEmailLogic);
 app.post("/archiveTask", archiveTaskLogic);
